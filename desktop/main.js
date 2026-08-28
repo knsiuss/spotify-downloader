@@ -104,7 +104,7 @@ if (!gotLock) {
     const ok = await waitServer(base);
     if (!ok) {
       const { dialog } = require("electron");
-      dialog.showErrorBox("Spotify Downloader", "Server internal gagal start. Cek log di %APPDATA%\\spotify-downloader\\logs");
+      dialog.showErrorBox("DROP", "Server internal gagal start. Cek log di %APPDATA%\\spotify-downloader\\logs");
       app.quit();
       return;
     }
@@ -116,7 +116,7 @@ if (!gotLock) {
       minHeight: 560,
       autoHideMenuBar: true,
       backgroundColor: "#f5f5f7",
-      title: "Spotify Downloader",
+      title: "DROP",
       show: false,
     });
     win.once("ready-to-show", () => win.show());

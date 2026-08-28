@@ -1,6 +1,6 @@
 @echo off
-title Spotify Downloader
-echo Menjalankan Spotify Downloader...
+title DROP
+echo Menjalankan DROP...
 echo.
 echo Browser akan terbuka otomatis di http://127.0.0.1:3001
 echo Tutup jendela ini (atau Ctrl+C) untuk berhenti.

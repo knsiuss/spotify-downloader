@@ -1,7 +1,7 @@
 {
-  "name": "spotify-downloader-desktop",
+  "name": "drop-desktop",
   "version": "0.2.0",
-  "description": "Spotify Downloader - desktop shell",
+  "description": "DROP — Media Downloader (desktop shell)",
   "main": "main.js",
   "author": "Quincy",
   "private": true,
@@ -14,8 +14,8 @@
     "electron-builder": "^25.0.0"
   },
   "build": {
-    "appId": "com.quincy.spotifydownloader",
-    "productName": "Spotify Downloader",
+    "appId": "com.quincy.drop",
+    "productName": "DROP",
     "directories": {
       "output": "../release",
       "buildResources": "."
@@ -39,7 +39,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Spotify Downloader"
+      "shortcutName": "DROP"
     }
   }
 }

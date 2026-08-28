@@ -2,9 +2,6 @@
 
 import { useState, useEffect, useRef } from "react";
 
-// Kosong = same-origin (UI diserve oleh backend sendiri — satu port).
-// Untuk pengembangan UI terpisah (next dev di :3000), set
-// NEXT_PUBLIC_BACKEND_URL=http://localhost:3001 di web/.env.local.
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
 
 // ---------------- Types ----------------
@@ -62,7 +59,35 @@ interface MusicSummary {
   reportPath?: string | null;
 }
 
-// ---------------- Icons (feather-style, no emoji) ----------------
+type JobStatus = "starting" | "running" | "done" | "error" | "cancelled";
+
+interface JobCard {
+  id: string;
+  kind: Tab;
+  subKind: "single" | "playlist" | "music";
+  status: JobStatus;
+  createdAt: number;
+  label: string;
+  // music / playlist common
+  playlistName: string;
+  playlistCover: string | null;
+  sourceType: "playlist" | "album" | "track";
+  rows: QueueRow[];
+  overall: { completed: number; total: number } | null;
+  summary: MusicSummary | { total: number; succeeded: number; failed: number; skipped: number; outputPath?: string | null; reportPath?: string | null } | null;
+  jobOutcome: "cancelled" | null;
+  destFolder: string | null;
+  queueFilter: string;
+  // video single
+  videoInfo: VideoInfoLite | null;
+  videoProgress: { percent: number | null; speedBps: number | null; etaSec: number | null; totalBytes: number | null } | null;
+  videoResult: { outputPath: string; skipped: boolean } | null;
+  warnings: string[];
+  errorMsg: string;
+  cancelling: boolean;
+}
+
+// ---------------- Icons ----------------
 
 function Svg({ children, size = 16 }: { children: React.ReactNode; size?: number }) {
   return (
@@ -94,6 +119,7 @@ const IconFolder = ({ size = 16 }: { size?: number }) => (
 const IconSun = () => <Svg size={16}><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" /></Svg>;
 const IconMoon = () => <Svg size={16}><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></Svg>;
 const IconChevron = () => <Svg size={14}><polyline points="9 18 15 12 9 6" /></Svg>;
+const IconTrash = () => <Svg size={14}><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></Svg>;
 
 function StatusGlyph({ state }: { state: RowState }) {
   switch (state) {
@@ -146,7 +172,8 @@ function dirname(p: string): string {
 }
 
 const SPOTIFY_RE = /(open\.spotify\.com\/(track|album|playlist)|spotify:(track|album|playlist):[A-Za-z0-9]+)/;
-const YOUTUBE_RE = /(youtube\.com\/(watch\?v=|shorts\/|embed\/)|youtu\.be\/|music\.youtube\.com)/;
+const YOUTUBE_RE = /(youtube\.com\/(watch\?v=|shorts\/|embed\/|playlist\?list=)|youtu\.be\/|music\.youtube\.com)/;
+const YOUTUBE_PLAYLIST_RE = /[?&]list=([A-Za-z0-9_-]+)/;
 
 const ALL_FORMATS = ["wav", "flac", "mp3"] as const;
 
@@ -229,7 +256,6 @@ function FolderPicker({
     }
   }
 
-  // Breadcrumb segments dari path Windows.
   const crumbs: Array<{ label: string; path: string }> = [];
   if (listing?.path) {
     const parts = listing.path.split("\\").filter(Boolean);
@@ -342,46 +368,23 @@ export default function Home() {
   const [videoFormat, setVideoFormat] = useState("mp4");
   const [videoOutputDir, setVideoOutputDir] = useState("");
 
-  // Active job state
-  const [phase, setPhase] = useState<"idle" | "starting" | "running">("idle");
-  const [viewKind, setViewKind] = useState<Tab>("music");
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const [cancelling, setCancelling] = useState(false);
+  // Job cards — stacked tanpa batas
+  const [jobs, setJobs] = useState<Map<string, JobCard>>(new Map());
+  const [jobOrder, setJobOrder] = useState<string[]>([]);
+  const [submitting, setSubmitting] = useState<Tab | null>(null);
   const [, setTick] = useState(0);
 
-  // Music live state
-  const [playlistName, setPlaylistName] = useState("");
-  const [playlistCover, setPlaylistCover] = useState<string | null>(null);
-  const [sourceType, setSourceType] = useState<"playlist" | "album" | "track">("playlist");
-  const [rows, setRows] = useState<QueueRow[]>([]);
-  const [overall, setOverall] = useState<{ completed: number; total: number } | null>(null);
-  const [summary, setSummary] = useState<MusicSummary | null>(null);
-  const [jobOutcome, setJobOutcome] = useState<"cancelled" | null>(null);
-
-  // Video live state
-  const [videoInfo, setVideoInfo] = useState<VideoInfoLite | null>(null);
-  const [videoProgress, setVideoProgress] = useState<{ percent: number | null; speedBps: number | null; etaSec: number | null; totalBytes: number | null } | null>(null);
-  const [videoResult, setVideoResult] = useState<{ outputPath: string; skipped: boolean } | null>(null);
-
   // Shared
-  const [warnings, setWarnings] = useState<string[]>([]);
-  const [errorMsg, setErrorMsg] = useState<string>("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [destFolder, setDestFolder] = useState<string | null>(null);
-  const [queueFilter, setQueueFilter] = useState("");
   const [navView, setNavView] = useState<"download" | "history">("download");
   const resultsRef = useRef<HTMLDivElement | null>(null);
-  // Reconnect stream: true setelah event terminal diterima.
-  const terminalRef = useRef(false);
 
   // Folder picker
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerTarget, setPickerTarget] = useState<"music" | "video">("music");
 
-  const startedAtRef = useRef(0);
-  const streamAbortRef = useRef<AbortController | null>(null);
-  // Ref supaya event handler selalu membaca kind terbaru (hindari stale closure).
-  const kindRef = useRef<Tab>("music");
+  const controllersRef = useRef<Map<string, AbortController>>(new Map());
+  const terminalsRef = useRef<Map<string, boolean>>(new Map());
 
   // Theme init + apply
   useEffect(() => {
@@ -407,7 +410,7 @@ export default function Home() {
     return () => { alive = false; clearInterval(t); };
   }, []);
 
-  // Prefill dari settings tersimpan (server-side, bertahan lintas restart)
+  // Prefill dari settings tersimpan
   useEffect(() => {
     fetch(`${BACKEND_URL}/api/settings`).then((r) => r.json()).then((s) => {
       if (s.lastOutputDir) setOutputDir(s.lastOutputDir);
@@ -426,13 +429,13 @@ export default function Home() {
     return () => clearInterval(t);
   }, [navView]);
 
-  // Drag & drop link ke mana saja + paste global (di luar input) -> auto-isi form
+  // Drag & drop link
   useEffect(() => {
     function handleLink(text: string | undefined | null) {
       if (!text) return;
       const t = text.trim();
       if (SPOTIFY_RE.test(t)) { setUrl(t); setTab("music"); }
-      else if (YOUTUBE_RE.test(t)) { setVideoUrl(t); setTab("video"); }
+      else if (YOUTUBE_RE.test(t) || YOUTUBE_PLAYLIST_RE.test(t)) { setVideoUrl(t); setTab("video"); }
     }
     const onDrop = (e: DragEvent) => {
       e.preventDefault();
@@ -441,7 +444,7 @@ export default function Home() {
     const onDragOver = (e: DragEvent) => e.preventDefault();
     const onPaste = (e: ClipboardEvent) => {
       const el = document.activeElement;
-      if (el && ["INPUT", "TEXTAREA"].includes(el.tagName)) return; // jangan curi paste di input
+      if (el && ["INPUT", "TEXTAREA"].includes(el.tagName)) return;
       handleLink(e.clipboardData?.getData("text"));
     };
     window.addEventListener("drop", onDrop);
@@ -468,12 +471,13 @@ export default function Home() {
     }).catch(() => {});
   }
 
-  // Elapsed ticker selama job jalan
+  // Elapsed ticker untuk semua running jobs
   useEffect(() => {
-    if (phase !== "running") return;
+    const hasRunning = [...jobs.values()].some((j) => j.status === "running" || j.status === "starting");
+    if (!hasRunning) return;
     const t = setInterval(() => setTick((x) => x + 1), 1000);
     return () => clearInterval(t);
-  }, [phase]);
+  }, [jobs]);
 
   // History awal
   useEffect(() => { void refreshHistory(); }, []);
@@ -485,68 +489,129 @@ export default function Home() {
     } catch { /* backend offline */ }
   }
 
-  /** Reset semua state tampilan untuk job baru / history yang dibuka lagi. */
-  function resetViewState(kind: Tab) {
-    streamAbortRef.current?.abort();
-    kindRef.current = kind;
-    setViewKind(kind);
-    setRows([]);
-    setOverall(null);
-    setSummary(null);
-    setJobOutcome(null);
-    setPlaylistCover(null);
-    setSourceType("playlist");
-    setVideoInfo(null);
-    setVideoProgress(null);
-    setVideoResult(null);
-    setWarnings([]);
-    setErrorMsg("");
-    setCancelling(false);
-    setPlaylistName("");
-    setDestFolder(null);
-    setQueueFilter("");
+  function createJobCard(id: string, kind: Tab): JobCard {
+    const isPlaylist = kind === "music" ? false : YOUTUBE_PLAYLIST_RE.test(videoUrl);
+    return {
+      id,
+      kind,
+      subKind: kind === "music" ? "music" : isPlaylist ? "playlist" : "single",
+      status: "starting",
+      createdAt: Date.now(),
+      label: kind === "music" ? url.slice(0, 60) : videoUrl.slice(0, 60),
+      playlistName: "",
+      playlistCover: null,
+      sourceType: "playlist",
+      rows: [],
+      overall: null,
+      summary: null,
+      jobOutcome: null,
+      destFolder: null,
+      queueFilter: "",
+      videoInfo: null,
+      videoProgress: null,
+      videoResult: null,
+      warnings: [],
+      errorMsg: "",
+      cancelling: false,
+    };
   }
 
-  /** Update satu baris queue berdasarkan index (immutable). */
-  function patchRow(index: number, patch: Partial<QueueRow>) {
-    setRows((prev) => prev.map((r) => (r.index === index ? { ...r, ...patch } : r)));
+  function updateJob(id: string, patch: Partial<JobCard> | ((j: JobCard) => JobCard)) {
+    setJobs((prev) => {
+      const cur = prev.get(id);
+      if (!cur) return prev;
+      const next = new Map(prev);
+      const updated = typeof patch === "function" ? (patch as any)(cur) : { ...cur, ...patch };
+      next.set(id, updated);
+      return next;
+    });
   }
 
-  function applyEvent(msg: Record<string, any>) {
-    const kind = kindRef.current;
+  function patchRow(jobId: string, index: number, patch: Partial<QueueRow>) {
+    setJobs((prev) => {
+      const cur = prev.get(jobId);
+      if (!cur) return prev;
+      const next = new Map(prev);
+      next.set(jobId, { ...cur, rows: cur.rows.map((r) => (r.index === index ? { ...r, ...patch } : r)) });
+      return next;
+    });
+  }
+
+  function applyEvent(jobId: string, msg: Record<string, any>) {
+    const job = jobs.get(jobId);
+    // fallback: cari dari map terbaru via setJobs updater - but we use direct state snapshot, need to handle async
+    // So we use functional setJobs for each case instead of reading jobs stale
     switch (msg.type) {
       case "start": {
-        if (kind === "music") {
-          setPlaylistName(String(msg.name ?? ""));
-          setPlaylistCover(msg.cover ?? null);
-          setSourceType(msg.sourceType === "album" ? "album" : msg.sourceType === "track" ? "track" : "playlist");
-          setDestFolder(msg.folder ?? null);
-          setRows(
-            (msg.tracks ?? []).map((t: any, i: number) => ({
-              index: i,
-              title: t.title,
-              artists: t.artists ?? [],
-              durationSec: t.durationSec ?? null,
-              coverArtUrl: t.coverArtUrl ?? null,
-              state: "queued" as RowState,
-              percent: null, speedBps: null, etaSec: null,
-              provider: null, error: null,
-              hasLyrics: false, instrumental: false,
-            })),
-          );
-          setOverall({ completed: 0, total: Number(msg.total ?? msg.tracks?.length ?? 0) });
-          if (msg.truncated) setWarnings((w) => [...w, "Playlist sangat panjang — hanya 100 lagu pertama yang bisa diambil."]);
+        // video single: {info}
+        // music / video-playlist: {total, name, cover, sourceType, folder, tracks, truncated, kind}
+        if (msg.info && !msg.tracks) {
+          // single video
+          setJobs((prev) => {
+            const cur = prev.get(jobId);
+            if (!cur) return prev;
+            const next = new Map(prev);
+            next.set(jobId, {
+              ...cur,
+              status: "running",
+              videoInfo: msg.info ? { id: String(msg.info.id ?? ""), title: String(msg.info.title ?? "Video"), channel: String(msg.info.channel ?? ""), durationSec: msg.info.durationSec ?? null, thumbnailUrl: msg.info.thumbnailUrl ?? null } : cur.videoInfo,
+              playlistName: msg.info?.title ?? cur.playlistName,
+              playlistCover: msg.info?.thumbnailUrl ?? cur.playlistCover,
+            });
+            return next;
+          });
+        } else if (msg.tracks) {
+          const isVideoPlaylist = msg.kind === "video-playlist";
+          setJobs((prev) => {
+            const cur = prev.get(jobId);
+            if (!cur) return prev;
+            const next = new Map(prev);
+            next.set(jobId, {
+              ...cur,
+              status: "running",
+              playlistName: String(msg.name ?? cur.playlistName),
+              playlistCover: msg.cover ?? cur.playlistCover,
+              sourceType: msg.sourceType === "album" ? "album" : msg.sourceType === "track" ? "track" : "playlist",
+              destFolder: msg.folder ?? cur.destFolder,
+              rows: (msg.tracks ?? []).map((t: any, i: number) => ({
+                index: i,
+                title: t.title,
+                artists: t.artists ?? (t.channel ? [t.channel] : []),
+                durationSec: t.durationSec ?? null,
+                coverArtUrl: t.coverArtUrl ?? t.thumbnailUrl ?? null,
+                state: "queued" as RowState,
+                percent: null, speedBps: null, etaSec: null,
+                provider: null, error: null,
+                hasLyrics: false, instrumental: false,
+              })),
+              overall: { completed: 0, total: Number(msg.total ?? msg.tracks?.length ?? 0) },
+              subKind: isVideoPlaylist ? "playlist" : "music",
+            });
+            if (msg.truncated) {
+              const n = new Map(next);
+              const j = n.get(jobId)!;
+              n.set(jobId, { ...j, warnings: [...j.warnings, "Playlist sangat panjang — hanya 100 lagu pertama yang bisa diambil."] });
+              return n;
+            }
+            return next;
+          });
         } else {
-          if (msg.info) setVideoInfo(msg.info);
-          else setVideoInfo({ id: "", title: "Menyiapkan...", channel: "", durationSec: null, thumbnailUrl: null });
+          // generic start without tracks (music metadata loading)
+          setJobs((prev) => {
+            const cur = prev.get(jobId);
+            if (!cur) return prev;
+            const next = new Map(prev);
+            next.set(jobId, { ...cur, status: "running", playlistName: String(msg.name ?? cur.playlistName), playlistCover: msg.cover ?? cur.playlistCover });
+            return next;
+          });
         }
         break;
       }
       case "track_stage":
-        patchRow(Number(msg.index), { state: msg.state });
+        patchRow(jobId, Number(msg.index), { state: msg.state });
         break;
       case "track_progress":
-        patchRow(Number(msg.index), {
+        patchRow(jobId, Number(msg.index), {
           state: "downloading",
           percent: typeof msg.percent === "number" ? msg.percent : null,
           speedBps: msg.speedBps ?? null,
@@ -556,7 +621,7 @@ export default function Home() {
       case "track": {
         const ok = Boolean(msg.ok);
         const skipped = ok && msg.error === "sudah ada";
-        patchRow(Number(msg.index), {
+        patchRow(jobId, Number(msg.index), {
           state: skipped ? "skipped" : ok ? "done" : "failed",
           provider: msg.provider ?? null,
           error: !ok || skipped ? msg.error : null,
@@ -566,52 +631,72 @@ export default function Home() {
         break;
       }
       case "progress":
-        setOverall({ completed: Number(msg.completed), total: Number(msg.total) });
+        updateJob(jobId, (j) => ({ ...j, overall: { completed: Number(msg.completed), total: Number(msg.total) } }));
         break;
       case "video_progress":
-        setVideoProgress({
-          percent: msg.percent ?? null,
-          speedBps: msg.speedBps ?? null,
-          etaSec: msg.etaSec ?? null,
-          totalBytes: msg.totalBytes ?? null,
-        });
+        updateJob(jobId, (j) => ({
+          ...j,
+          status: "running",
+          videoProgress: {
+            percent: msg.percent ?? null,
+            speedBps: msg.speedBps ?? null,
+            etaSec: msg.etaSec ?? null,
+            totalBytes: msg.totalBytes ?? null,
+          },
+        }));
         break;
       case "warning":
-        setWarnings((w) => [...w, String(msg.message)]);
+        updateJob(jobId, (j) => ({ ...j, warnings: [...j.warnings, String(msg.message)] }));
         break;
       case "cancelling":
-        setCancelling(true);
+        updateJob(jobId, { cancelling: true });
         break;
       case "cancelled":
-        setJobOutcome("cancelled");
-        terminalRef.current = true;
-        finishActiveJob();
+        terminalsRef.current.set(jobId, true);
+        updateJob(jobId, { status: "cancelled", jobOutcome: "cancelled" });
+        void refreshHistory();
         break;
       case "done":
-        if (kind === "music") setSummary({ ...(msg.summary ?? {}), reportPath: msg.reportPath ?? null });
-        else setVideoResult({ outputPath: String(msg.outputPath ?? ""), skipped: Boolean(msg.skipped) });
-        terminalRef.current = true;
-        finishActiveJob();
+        terminalsRef.current.set(jobId, true);
+        setJobs((prev) => {
+          const cur = prev.get(jobId);
+          if (!cur) return prev;
+          const next = new Map(prev);
+          // video single vs playlist vs music
+          if (cur.kind === "video" && cur.subKind === "single" && !cur.rows.length) {
+            next.set(jobId, {
+              ...cur,
+              status: "done",
+              videoResult: { outputPath: String(msg.outputPath ?? ""), skipped: Boolean(msg.skipped) },
+              summary: { outputPath: String(msg.outputPath ?? ""), total: 1, succeeded: msg.skipped ? 0 : 1, failed: 0, skipped: msg.skipped ? 1 : 0 } as any,
+            });
+          } else if (msg.summary) {
+            next.set(jobId, {
+              ...cur,
+              status: "done",
+              summary: { ...(msg.summary as any), reportPath: (msg as any).reportPath ?? (msg.summary as any)?.reportPath ?? null },
+            });
+          } else {
+            next.set(jobId, { ...cur, status: "done" });
+          }
+          return next;
+        });
+        void refreshHistory();
         break;
       case "error":
-        setErrorMsg(String(msg.error ?? "Terjadi kesalahan"));
-        terminalRef.current = true;
-        finishActiveJob();
+        terminalsRef.current.set(jobId, true);
+        updateJob(jobId, { status: "error", errorMsg: String(msg.error ?? "Terjadi kesalahan") });
+        void refreshHistory();
         break;
       default:
-        break; // ping & lainnya diabaikan
+        break;
     }
   }
 
-  function finishActiveJob() {
-    setPhase("idle");
-    void refreshHistory();
-  }
-
-  /** Buka stream event NDJSON untuk satu job; auto-reconnect kalau putus di tengah jalan. */
   async function streamEvents(jobId: string, attempt = 0) {
     const ctrl = new AbortController();
-    streamAbortRef.current = ctrl;
+    controllersRef.current.set(jobId, ctrl);
+    terminalsRef.current.set(jobId, false);
     try {
       const res = await fetch(`${BACKEND_URL}/api/jobs/${jobId}/events`, { signal: ctrl.signal });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
@@ -626,50 +711,49 @@ export default function Home() {
         buf = lines.pop() ?? "";
         for (const line of lines) {
           if (!line.trim()) continue;
-          try { applyEvent(JSON.parse(line)); } catch { /* baris rusak dilewati */ }
+          try { applyEvent(jobId, JSON.parse(line)); } catch { }
         }
       }
       if (buf.trim()) {
-        try { applyEvent(JSON.parse(buf)); } catch { /* abaikan */ }
+        try { applyEvent(jobId, JSON.parse(buf)); } catch { }
       }
-      // Stream tutup tanpa terminal = server restart / koneksi putus.
-      // Buffer event ada di server, jadi reconnect cukup untuk replay semuanya.
-      if (!terminalRef.current && attempt < 5) {
+      if (!terminalsRef.current.get(jobId) && attempt < 5) {
         await new Promise((r) => setTimeout(r, 1200));
         if (!ctrl.signal.aborted) return streamEvents(jobId, attempt + 1);
       }
     } catch (err) {
-      if (!ctrl.signal.aborted && !terminalRef.current && attempt < 5) {
+      if (!ctrl.signal.aborted && !terminalsRef.current.get(jobId) && attempt < 5) {
         await new Promise((r) => setTimeout(r, 1200));
         return streamEvents(jobId, attempt + 1);
       }
       if (!ctrl.signal.aborted) {
-        setErrorMsg(err instanceof Error ? err.message : "Stream terputus dari backend");
-        finishActiveJob();
+        updateJob(jobId, { status: "error", errorMsg: err instanceof Error ? err.message : "Stream terputus" });
       }
+    } finally {
+      controllersRef.current.delete(jobId);
     }
   }
 
   async function beginJob(jobId: string, kind: Tab) {
-    resetViewState(kind);
-    terminalRef.current = false;
-    setActiveJobId(jobId);
-    setPhase("running");
-    startedAtRef.current = Date.now();
+    const card = createJobCard(jobId, kind);
+    card.status = "running";
+    setJobs((prev) => {
+      const next = new Map(prev);
+      next.set(jobId, card);
+      return next;
+    });
+    setJobOrder((prev) => [jobId, ...prev.filter((id) => id !== jobId)]);
     saveSettings();
     void streamEvents(jobId);
-    // Di layar sempit, hasil muncul di bawah form — araskan panduan ke sana.
-    if (window.innerWidth < 920) {
+    if (typeof window !== "undefined" && window.innerWidth < 920) {
       setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
     }
   }
 
   async function submitMusic(e: React.FormEvent) {
     e.preventDefault();
-    if (!urlValid || busy) return;
-    setPhase("starting");
-    setErrorMsg("");
-    setTab("music");
+    if (!urlValid || submitting) return;
+    setSubmitting("music");
     try {
       const res = await fetch(`${BACKEND_URL}/api/download`, {
         method: "POST",
@@ -684,23 +768,32 @@ export default function Home() {
       });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.jobId) {
-        setErrorMsg(data?.error ?? `HTTP ${res.status}`);
-        setPhase("idle");
+        // buat card error sementara
+        const tmpId = `err-${Date.now()}`;
+        const card = createJobCard(tmpId, "music");
+        card.status = "error";
+        card.errorMsg = data?.error ?? `HTTP ${res.status}`;
+        setJobs((prev) => new Map(prev).set(tmpId, card));
+        setJobOrder((prev) => [tmpId, ...prev]);
         return;
       }
       await beginJob(data.jobId, "music");
     } catch {
-      setErrorMsg("Server belum jalan. Buka aplikasi lewat start.bat ya.");
-      setPhase("idle");
+      const tmpId = `err-${Date.now()}`;
+      const card = createJobCard(tmpId, "music");
+      card.status = "error";
+      card.errorMsg = "Server belum jalan. Buka aplikasi lewat start.bat ya.";
+      setJobs((prev) => new Map(prev).set(tmpId, card));
+      setJobOrder((prev) => [tmpId, ...prev]);
+    } finally {
+      setSubmitting(null);
     }
   }
 
   async function submitVideo(e: React.FormEvent) {
     e.preventDefault();
-    if (!videoUrlValid || busy) return;
-    setPhase("starting");
-    setErrorMsg("");
-    setTab("video");
+    if (!videoUrlValid || submitting) return;
+    setSubmitting("video");
     try {
       const res = await fetch(`${BACKEND_URL}/api/download/video`, {
         method: "POST",
@@ -714,24 +807,44 @@ export default function Home() {
       });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.jobId) {
-        setErrorMsg(data?.error ?? `HTTP ${res.status}`);
-        setPhase("idle");
+        const tmpId = `err-${Date.now()}`;
+        const card = createJobCard(tmpId, "video");
+        card.status = "error";
+        card.errorMsg = data?.error ?? `HTTP ${res.status}`;
+        setJobs((prev) => new Map(prev).set(tmpId, card));
+        setJobOrder((prev) => [tmpId, ...prev]);
         return;
       }
       await beginJob(data.jobId, "video");
     } catch {
-      setErrorMsg("Server belum jalan. Buka aplikasi lewat start.bat ya.");
-      setPhase("idle");
+      const tmpId = `err-${Date.now()}`;
+      const card = createJobCard(tmpId, "video");
+      card.status = "error";
+      card.errorMsg = "Server belum jalan. Buka aplikasi lewat start.bat ya.";
+      setJobs((prev) => new Map(prev).set(tmpId, card));
+      setJobOrder((prev) => [tmpId, ...prev]);
+    } finally {
+      setSubmitting(null);
     }
   }
 
-  async function cancelJob() {
-    if (!activeJobId) return;
-    setCancelling(true);
+  async function cancelJob(jobId: string) {
+    updateJob(jobId, { cancelling: true });
     try {
-      await fetch(`${BACKEND_URL}/api/jobs/${activeJobId}`, { method: "DELETE" });
-      // Event "cancelling"/"cancelled" akan datang lewat stream.
-    } catch { /* stream akan menangani */ }
+      await fetch(`${BACKEND_URL}/api/jobs/${jobId}`, { method: "DELETE" });
+    } catch { }
+  }
+
+  function dismissJob(jobId: string) {
+    controllersRef.current.get(jobId)?.abort();
+    controllersRef.current.delete(jobId);
+    terminalsRef.current.delete(jobId);
+    setJobs((prev) => {
+      const next = new Map(prev);
+      next.delete(jobId);
+      return next;
+    });
+    setJobOrder((prev) => prev.filter((id) => id !== jobId));
   }
 
   async function openFolder(p: string | null) {
@@ -739,17 +852,45 @@ export default function Home() {
     try { await fetch(`${BACKEND_URL}/api/open-path`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: p }),
-    }); } catch { /* diam */ }
+    }); } catch { }
   }
 
-  /** Buka job lama dari history (replay buffer event). */
   async function openHistory(item: HistoryItem) {
-    resetViewState(item.kind);
-    setTab(item.kind);
-    setActiveJobId(item.id);
-    setPhase(item.status === "running" ? "running" : "idle");
-    startedAtRef.current = Date.now();
+    // buka sebagai card replay
+    const tmpCard: JobCard = {
+      id: item.id,
+      kind: item.kind as Tab,
+      subKind: item.kind === "music" ? "music" : "single",
+      status: item.status === "running" ? "running" : item.status === "done" ? "done" : item.status as any,
+      createdAt: item.createdAt,
+      label: item.label,
+      playlistName: item.label,
+      playlistCover: (item as any).meta?.cover ?? null,
+      sourceType: "playlist",
+      rows: [],
+      overall: null,
+      summary: item.summary as any,
+      jobOutcome: item.status === "cancelled" ? "cancelled" : null,
+      destFolder: null,
+      queueFilter: "",
+      videoInfo: null,
+      videoProgress: null,
+      videoResult: item.summary?.outputPath ? { outputPath: String(item.summary.outputPath), skipped: Boolean((item.summary as any).skipped) } : null,
+      warnings: [],
+      errorMsg: item.error ?? "",
+      cancelling: false,
+    };
+    setJobs((prev) => {
+      if (prev.has(item.id)) return prev;
+      const next = new Map(prev);
+      next.set(item.id, tmpCard);
+      return next;
+    });
+    setJobOrder((prev) => (prev.includes(item.id) ? prev : [item.id, ...prev]));
+    setNavView("download");
+    terminalsRef.current.set(item.id, false);
     void streamEvents(item.id);
+    setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
   }
 
   function toggleFormat(f: string) {
@@ -768,33 +909,234 @@ export default function Home() {
 
   // Derived
   const urlValid = SPOTIFY_RE.test(url);
-  const videoUrlValid = YOUTUBE_RE.test(videoUrl);
-  const busy = phase === "starting" || phase === "running";
-
-  const elapsed = busy && startedAtRef.current ? Math.floor((Date.now() - startedAtRef.current) / 1000) : 0;
-  const pct = overall && overall.total > 0 ? Math.round((overall.completed / overall.total) * 100) : 0;
-  const overallEta =
-    overall && overall.completed > 0 && busy && elapsed > 0
-      ? Math.round((elapsed / overall.completed) * (overall.total - overall.completed))
-      : null;
-
+  const videoUrlValid = YOUTUBE_RE.test(videoUrl) || YOUTUBE_PLAYLIST_RE.test(videoUrl);
+  const isVideoPlaylist = YOUTUBE_PLAYLIST_RE.test(videoUrl);
   const activeOutputDir = pickerTarget === "music" ? outputDir : videoOutputDir;
-  const typeLabel = sourceType === "album" ? "Album" : sourceType === "track" ? "Lagu" : "Playlist";
 
-  const visibleRows = queueFilter
-    ? rows.filter((r) => `${r.title} ${r.artists.join(" ")}`.toLowerCase().includes(queueFilter.trim().toLowerCase()))
-    : rows;
-  const showQueueSearch = rows.length >= 10;
-  const hasResults = viewKind === "music" ? (rows.length > 0 || playlistName) : Boolean(videoInfo || videoProgress || videoResult);
+  const orderedJobs = jobOrder.map((id) => jobs.get(id)).filter(Boolean) as JobCard[];
+  const hasJobs = orderedJobs.length > 0;
+  const runningCount = orderedJobs.filter((j) => j.status === "running" || j.status === "starting").length;
+
+  function JobCardView({ job }: { job: JobCard }) {
+    const elapsed = job.status === "running" || job.status === "starting" ? Math.floor((Date.now() - job.createdAt) / 1000) : 0;
+    const pct = job.overall && job.overall.total > 0 ? Math.round((job.overall.completed / job.overall.total) * 100) : 0;
+    const overallEta = job.overall && job.overall.completed > 0 && (job.status === "running") && elapsed > 0
+      ? Math.round((elapsed / job.overall.completed) * (job.overall.total - job.overall.completed))
+      : null;
+    const typeLabel = job.sourceType === "album" ? "Album" : job.sourceType === "track" ? "Lagu" : "Playlist";
+    const isMusicOrPlaylist = job.kind === "music" || job.subKind === "playlist";
+    const isRunning = job.status === "running" || job.status === "starting";
+    const summaryAny = job.summary as any;
+
+    const visibleRows = job.queueFilter
+      ? job.rows.filter((r) => `${r.title} ${r.artists.join(" ")}`.toLowerCase().includes(job.queueFilter.trim().toLowerCase()))
+      : job.rows;
+    const showQueueSearch = job.rows.length >= 10;
+
+    if (isMusicOrPlaylist) {
+      const total = job.overall?.total ?? job.rows.length;
+      const completed = job.overall?.completed ?? job.rows.filter((r) => r.state === "done" || r.state === "skipped").length;
+      const pctLocal = total > 0 ? Math.round((completed / total) * 100) : 0;
+      return (
+        <div className={`job-card ${isRunning ? "running" : ""} ${job.status}`} style={{ animationDelay: "0ms" }}>
+          <div className="job-card-head">
+            <div className="hero">
+              <div className="hero-art">
+                {job.playlistCover
+                  ? <img src={job.playlistCover} alt="" referrerPolicy="no-referrer" />
+                  : <span className="hero-art-fallback"><IconMusic size={26} /></span>}
+              </div>
+              <div className="hero-info">
+                <span className="hero-kind">{job.kind === "video" ? "Video Playlist" : typeLabel}</span>
+                <div className="hero-name" title={job.playlistName || job.label}>{job.playlistName || job.label || "Mengunduh..."}</div>
+                <div className="hero-sub">
+                  {job.overall ? <>{completed}/{total} {job.kind === "video" ? "video" : "lagu"} selesai</> : `${total} ${job.kind === "video" ? "video" : "lagu"}`}
+                  {job.destFolder && <> · ke <b>{pathTail(job.destFolder)}</b></>}
+                  {job.jobOutcome === "cancelled" && " · dibatalkan"}
+                  {job.status === "done" && summaryAny?.succeeded !== undefined && <> · {summaryAny.succeeded} berhasil</>}
+                </div>
+              </div>
+              <div className="hero-actions">
+                <div className={`pct-big ${isRunning ? "pulse" : ""}`}>{pctLocal}<small>%</small></div>
+                {isRunning ? (
+                  <button type="button" className="btn danger-ghost btn-sm" onClick={() => cancelJob(job.id)} disabled={job.cancelling}>
+                    <IconStop /> {job.cancelling ? "Membatalkan..." : "Batalkan"}
+                  </button>
+                ) : (
+                  <button type="button" className="icon-btn" onClick={() => dismissJob(job.id)} aria-label="Tutup"><IconX /></button>
+                )}
+              </div>
+            </div>
+            {(isRunning || job.overall) && (
+              <>
+                <div className="bar bar--hero"><div className="bar-fill bar-fill--hero" style={{ width: `${pctLocal}%` }} /></div>
+                <div className="hero-stats">
+                  {elapsed > 0 && isRunning && <span>{fmtTime(elapsed)} berjalan</span>}
+                  {overallEta !== null && isRunning && <span>sisa ± {fmtTime(overallEta)}</span>}
+                  {job.status === "done" && summaryAny?.durationMs && <span>selesai dalam {fmtTime(summaryAny.durationMs / 1000)}</span>}
+                  {job.warnings.length > 0 && <span className="warn-text">{job.warnings[0]}</span>}
+                </div>
+              </>
+            )}
+          </div>
+
+          {job.rows.length > 0 && (
+            <div className="queue">
+              <div className="queue-head">
+                <div>
+                  <div className="queue-title">{job.kind === "video" ? "Daftar video" : "Daftar lagu"}</div>
+                  <div className="queue-sub">
+                    {visibleRows.length === job.rows.length
+                      ? `${job.rows.length} ${job.kind === "video" ? "video" : "lagu"}${job.summary ? ` · ${(job.summary as any).succeeded ?? 0} berhasil` : ""}`
+                      : `${visibleRows.length} dari ${job.rows.length}`}
+                  </div>
+                </div>
+                {showQueueSearch && (
+                  <div className="queue-search">
+                    <IconSearch />
+                    <input type="text" value={job.queueFilter} onChange={(e) => updateJob(job.id, { queueFilter: e.target.value })} placeholder="Cari..." />
+                  </div>
+                )}
+              </div>
+              {visibleRows.map((r, i) => (
+                <div key={`${r.index}-${r.title}`} className={`qrow st-${r.state}`} style={{ animationDelay: `${Math.min(i * 22, 280)}ms` }}>
+                  <div className={`thumb-wrap st-${r.state}`}>
+                    <div className="thumb-fallback"><IconMusic size={16} /></div>
+                    {r.coverArtUrl && (
+                      <img className="thumb" src={r.coverArtUrl} alt="" loading="lazy" referrerPolicy="no-referrer"
+                        onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = "hidden"; }} />
+                    )}
+                    <span className="thumb-badge">{<StatusGlyph state={r.state} />}</span>
+                  </div>
+                  <div className="qbody">
+                    <div className="qname" title={r.title}>{r.title}</div>
+                    <div className="qsub">
+                      {r.artists.length > 0 && <span>{r.artists.join(", ")}</span>}
+                      {r.durationSec ? <><span className="sep">·</span><span>{fmtTime(r.durationSec)}</span></> : null}
+                      {r.state === "downloading" && r.percent !== null && <><span className="sep">·</span><span>{Math.round(r.percent)}%</span></>}
+                      {r.state === "downloading" && r.speedBps ? <><span className="sep">·</span><span>{fmtSpeed(r.speedBps)}</span></> : null}
+                      {r.state === "downloading" && r.etaSec ? <><span className="sep">·</span><span>sisa {fmtTime(r.etaSec)}</span></> : null}
+                      {r.provider && r.state === "done" && <><span className="sep">·</span><span>via {r.provider}</span></>}
+                      {r.hasLyrics && <span className="tag accent">lirik</span>}
+                      {r.instrumental && <span className="tag info">instrumental</span>}
+                      {r.state === "skipped" && <span className="tag warn">sudah ada</span>}
+                      {r.state === "failed" && r.error && <span className="err-text" title={r.error}>— {r.error.split("\n")[0]}</span>}
+                    </div>
+                    {r.state === "downloading" && r.percent !== null && (
+                      <div className="minibar"><div className="minibar-fill" style={{ width: `${r.percent}%` }} /></div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {job.status === "done" && job.summary && (
+            <>
+              <div className="summary-box">
+                <div className="stat ok"><b>{(job.summary as any).succeeded ?? 0}</b><span>Berhasil</span></div>
+                <div className="stat fail"><b>{(job.summary as any).failed ?? 0}</b><span>Gagal</span></div>
+                <div className="stat skip"><b>{(job.summary as any).skipped ?? 0}</b><span>Diskip</span></div>
+                <div className="stat"><b>{(job.summary as any).total ?? job.rows.length}</b><span>Total</span></div>
+              </div>
+              {job.destFolder && (
+                <div className="dest-row">
+                  <span className="dest-icon"><IconFolder /></span>
+                  <div className="dest-info">
+                    <div className="dest-label">Tersimpan di</div>
+                    <div className="dest-path" title={job.destFolder}>{job.destFolder}</div>
+                  </div>
+                  <button type="button" className="btn ghost" onClick={() => openFolder(job.destFolder!)}>Buka folder</button>
+                </div>
+              )}
+            </>
+          )}
+          {job.warnings.map((w, i) => (
+            <div key={i} className="warn-box"><IconWarn /> <span>{w}</span></div>
+          ))}
+          {job.errorMsg && <div className="error-box"><IconX /> <span>{job.errorMsg}</span></div>}
+        </div>
+      );
+    }
+
+    // Single video
+    return (
+      <div className={`job-card ${isRunning ? "running" : ""} ${job.status}`}>
+        <div className="job-card-head">
+          {job.videoInfo && (
+            <div className="video-preview">
+              {job.videoInfo.thumbnailUrl && <img className="video-thumb" src={job.videoInfo.thumbnailUrl} alt="" referrerPolicy="no-referrer" />}
+              <div className="video-meta">
+                <div className="t" title={job.videoInfo.title}>{job.videoInfo.title}</div>
+                <div className="s">{[job.videoInfo.channel, fmtTime(job.videoInfo.durationSec ?? null)].filter(Boolean).join(" · ") || "Mengambil info video..."}</div>
+              </div>
+              <div className="hero-actions">
+                {isRunning ? (
+                  <button type="button" className="btn danger-ghost btn-sm" onClick={() => cancelJob(job.id)} disabled={job.cancelling}>
+                    <IconStop /> {job.cancelling ? "Membatalkan..." : "Batalkan"}
+                  </button>
+                ) : (
+                  <button type="button" className="icon-btn" onClick={() => dismissJob(job.id)} aria-label="Tutup"><IconX /></button>
+                )}
+              </div>
+            </div>
+          )}
+          {!job.videoInfo && isRunning && (
+            <div className="progress-card">
+              <div className="progress-top"><span>Menyiapkan video...</span><span className="spinner" /></div>
+              <div className="bar indeterminate" />
+            </div>
+          )}
+          {job.videoProgress && !job.videoResult && (
+            <div className="progress-card">
+              <div className="progress-top">
+                <span>{isRunning ? "Mengunduh video" : "Menunggu"}</span>
+                <span className="pct">{job.videoProgress.percent !== null ? `${Math.round(job.videoProgress.percent)}%` : "..."}</span>
+              </div>
+              {job.videoProgress.percent !== null ? (
+                <div className="bar bar--video"><div className="bar-fill bar-fill--video" style={{ width: `${job.videoProgress.percent}%` }} /></div>
+              ) : (
+                <div className="bar indeterminate" />
+              )}
+              <div className="hero-stats">
+                {job.videoProgress.speedBps ? <span>{fmtSpeed(job.videoProgress.speedBps)}</span> : null}
+                {job.videoProgress.etaSec ? <span>sisa ± {fmtTime(job.videoProgress.etaSec)}</span> : null}
+                {job.videoProgress.totalBytes ? <span>{fmtBytes(job.videoProgress.totalBytes)}</span> : null}
+                {job.cancelling && <span>Membatalkan...</span>}
+                {elapsed > 0 && <span>{fmtTime(elapsed)} berjalan</span>}
+              </div>
+            </div>
+          )}
+          {job.videoResult && (
+            <div className="queue">
+              <div className="queue-head">
+                <div>
+                  <div className="queue-title">{job.videoResult.skipped ? "Video sudah pernah diunduh" : "Video selesai diunduh"}</div>
+                  <div className="queue-sub" title={job.videoResult.outputPath}>{job.videoResult.outputPath}</div>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button type="button" className="btn ghost" onClick={() => job.videoResult?.outputPath && openFolder(job.videoResult.outputPath)}>Buka folder</button>
+                  <button type="button" className="icon-btn" onClick={() => dismissJob(job.id)} aria-label="Tutup"><IconX /></button>
+                </div>
+              </div>
+            </div>
+          )}
+          {job.errorMsg && <div className="error-box"><IconX /> <span>{job.errorMsg}</span></div>}
+          {job.warnings.map((w, i) => (
+            <div key={i} className="warn-box"><IconWarn /> <span>{w}</span></div>
+          ))}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="container">
-      {/* Top bar ala Apple: brand kiri, navigasi tengah, kontrol kanan */}
       <div className="topbar">
         <div className="topbar-inner">
           <div className="brand">
             <span className="brand-mark"><IconMusic size={16} /></span>
-            <span className="brand-name">Spotify Downloader</span>
+            <span className="brand-name">DROP</span>
           </div>
           <nav className="topnav" aria-label="Navigasi utama">
             <button className={navView === "download" ? "on" : ""} onClick={() => setNavView("download")}>
@@ -802,7 +1144,7 @@ export default function Home() {
             </button>
             <button className={navView === "history" ? "on" : ""} onClick={() => setNavView("history")}>
               Riwayat
-              {history.some((h) => h.status === "running") && <span className="nav-pulse" />}
+              {(history.some((h) => h.status === "running") || runningCount > 0) && <span className="nav-pulse" />}
             </button>
           </nav>
           <div className="topbar-right">
@@ -818,11 +1160,10 @@ export default function Home() {
       </div>
 
       {navView === "history" ? (
-        /* ---------- HALAMAN RIWAYAT ---------- */
         <div className="history-view">
           <div className="history-hero">
             <h2>Riwayat unduhan</h2>
-            <p>Semua aktivitas download di komputer ini, tersimpan otomatis.</p>
+            <p>Semua aktivitas download di komputermu, tersimpan otomatis.</p>
           </div>
           {history.length === 0 && (
             <div className="empty-state">
@@ -835,7 +1176,7 @@ export default function Home() {
             </div>
           )}
           {history.map((h) => {
-            const s = h.summary ?? {};
+            const s: any = h.summary ?? {};
             const folder = s.reportPath ? dirname(s.reportPath) : s.outputPath ? dirname(s.outputPath) : null;
             const statusText = h.status === "done" ? "Selesai" : h.status === "error" ? "Gagal" : h.status === "cancelled" ? "Dibatalkan" : "Sedang berjalan";
             return (
@@ -850,7 +1191,7 @@ export default function Home() {
                     <span className={`hrow-status ${h.status}`}>{statusText}</span>
                     <span className="sep">·</span>
                     <span>{fmtAgo(h.createdAt)}</span>
-                    {s.total ? <><span className="sep">·</span><span>{s.succeeded ?? 0}/{s.total} lagu</span></> : null}
+                    {s.total ? <><span className="sep">·</span><span>{s.succeeded ?? 0}/{s.total} {h.kind === "video" && s.total === 1 ? "video" : "lagu"}</span></> : null}
                     {h.status === "running" && <span className="tag accent">berlangsung</span>}
                   </div>
                 </div>
@@ -866,20 +1207,17 @@ export default function Home() {
         </div>
       ) : (
       <>
-      {/* Layout dua kolom: form kiri, hasil kanan (stack di layar sempit) */}
       <div className="layout">
         <div className="col-form">
-      {/* Tabs */}
       <div className="tabs">
-        <button className={`tab ${tab === "music" ? "active" : ""}`} onClick={() => setTab("music")} disabled={busy}>
+        <button className={`tab ${tab === "music" ? "active" : ""}`} onClick={() => setTab("music")}>
           <IconMusic size={15} /> Musik
         </button>
-        <button className={`tab ${tab === "video" ? "active" : ""}`} onClick={() => setTab("video")} disabled={busy}>
+        <button className={`tab ${tab === "video" ? "active" : ""}`} onClick={() => setTab("video")}>
           <IconVideo /> Video
         </button>
       </div>
 
-      {/* ---------- FORM MUSIC ---------- */}
       {tab === "music" && (
         <form onSubmit={submitMusic} className="card">
           <div className="field">
@@ -891,7 +1229,6 @@ export default function Home() {
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 placeholder="https://open.spotify.com/playlist/..."
-                disabled={busy}
                 className={url.length > 0 && !urlValid ? "input-error" : ""}
               />
             </div>
@@ -904,7 +1241,7 @@ export default function Home() {
               <div className="chips">
                 {ALL_FORMATS.map((f) => (
                   <button type="button" key={f} className={`chip ${formats.has(f) ? "on" : ""}`}
-                    onClick={() => toggleFormat(f)} disabled={busy}>
+                    onClick={() => toggleFormat(f)}>
                     {f.toUpperCase()}
                   </button>
                 ))}
@@ -913,13 +1250,13 @@ export default function Home() {
             <div className="field">
               <label className="label">Jumlah lagu <span className="hint">kosongkan untuk semua</span></label>
               <input type="number" min={1} value={limit} onChange={(e) => setLimit(e.target.value)}
-                placeholder="Semua" disabled={busy} />
+                placeholder="Semua" />
             </div>
           </div>
 
           <div className="field">
             <label className="label">Lirik lagu</label>
-            <div className={`switch-row`} onClick={() => !busy && setWantLyrics((v) => !v)} role="switch" aria-checked={wantLyrics}>
+            <div className={`switch-row`} onClick={() => setWantLyrics((v) => !v)} role="switch" aria-checked={wantLyrics}>
               <span className="switch-text">
                 Tanam lirik ke dalam file
                 <small>tersimpan di tag lagu — tanpa file terpisah, tampil di foobar/MusicBee/pemutar HP</small>
@@ -936,40 +1273,33 @@ export default function Home() {
                 <div className="target-name">{outputDir ? pathTail(outputDir) : "Musik (default)"}</div>
                 <div className="target-path">{outputDir || "otomatis di folder aplikasi"}</div>
               </div>
-              <button type="button" className="btn ghost" onClick={() => openPicker("music")} disabled={busy}>
+              <button type="button" className="btn ghost" onClick={() => openPicker("music")}>
                 Jelajahi...
               </button>
             </div>
           </div>
 
           <div className="actions">
-            <button type="submit" className="btn" disabled={busy || !urlValid || formats.size === 0}>
-              {busy && viewKind === "music"
-                ? <><span className="spinner" /> Mengunduh{overall ? ` ${overall.completed}/${overall.total}` : "..."}{elapsed > 0 ? ` · ${fmtTime(elapsed)}` : ""}</>
-                : <><IconDownload /> Download musik</>}
+            <button type="submit" className="btn" disabled={!urlValid || formats.size === 0 || submitting === "music"}>
+              {submitting === "music" ? <><span className="spinner" /> Memulai...</> : <><IconDownload /> Download musik</>}
             </button>
-            {busy && activeJobId && viewKind === "music" && (
-              <button type="button" className="btn danger-ghost" onClick={cancelJob} disabled={cancelling}>
-                <IconStop /> {cancelling ? "Membatalkan..." : "Batalkan"}
-              </button>
-            )}
           </div>
+          {runningCount > 0 && <div className="inline-hint" style={{ marginTop: 10 }}>{runningCount} unduhan berjalan — kamu bisa tambah lagi tanpa menunggu.</div>}
         </form>
       )}
 
-      {/* ---------- FORM VIDEO ---------- */}
       {tab === "video" && (
         <form onSubmit={submitVideo} className="card">
           <div className="field">
-            <label className="label">Tempel link YouTube <span className="hint">video biasa atau shorts</span></label>
+            <label className="label">Tempel link YouTube <span className="hint">video, shorts, atau playlist</span></label>
             <div className="input-wrap has-icon">
               <IconLink />
               <input type="text" value={videoUrl} onChange={(e) => setVideoUrl(e.target.value)}
-                placeholder="https://www.youtube.com/watch?v=..."
-                disabled={busy}
+                placeholder="https://www.youtube.com/watch?v=... atau playlist?list=..."
                 className={videoUrl.length > 0 && !videoUrlValid ? "input-error" : ""} />
             </div>
             {videoUrl.length > 0 && !videoUrlValid && <div className="inline-hint">Link YouTube belum benar.</div>}
+            {isVideoPlaylist && videoUrlValid && <div className="inline-hint" style={{ color: "var(--accent-deep)" }}>Playlist terdeteksi — semua video akan di-download berurutan.</div>}
           </div>
 
           <div className="field">
@@ -977,7 +1307,7 @@ export default function Home() {
             <div className="chips">
               {["144", "240", "360", "480", "720", "1080", "1440", "2160", "best"].map((r) => (
                 <button type="button" key={r} className={`chip ${resolution === r ? "on" : ""}`}
-                  onClick={() => setResolution(r)} disabled={busy}>
+                  onClick={() => setResolution(r)}>
                   {r === "best" ? "Terbaik" : `${r}p`}
                 </button>
               ))}
@@ -989,7 +1319,7 @@ export default function Home() {
             <div className="chips">
               {["mp4", "webm", "mkv"].map((f) => (
                 <button type="button" key={f} className={`chip ${videoFormat === f ? "on" : ""}`}
-                  onClick={() => setVideoFormat(f)} disabled={busy}>
+                  onClick={() => setVideoFormat(f)}>
                   {f.toUpperCase()}
                 </button>
               ))}
@@ -1001,229 +1331,60 @@ export default function Home() {
             <div className="target-box">
               <span className="target-icon"><IconFolder /></span>
               <div className="target-info">
-                <div className="target-name">{videoOutputDir ? pathTail(videoOutputDir) : "Musik (default)"}</div>
+                <div className="target-name">{videoOutputDir ? pathTail(videoOutputDir) : "Video (default)"}</div>
                 <div className="target-path">{videoOutputDir || "otomatis di folder aplikasi"}</div>
               </div>
-              <button type="button" className="btn ghost" onClick={() => openPicker("video")} disabled={busy}>
+              <button type="button" className="btn ghost" onClick={() => openPicker("video")}>
                 Jelajahi...
               </button>
             </div>
           </div>
 
           <div className="actions">
-            <button type="submit" className="btn" disabled={busy || !videoUrlValid}>
-              {busy && viewKind === "video"
-                ? <><span className="spinner" /> Mengunduh video{elapsed > 0 ? ` · ${fmtTime(elapsed)}` : ""}</>
-                : <><IconDownload /> Download video</>}
+            <button type="submit" className="btn" disabled={!videoUrlValid || submitting === "video"}>
+              {submitting === "video" ? <><span className="spinner" /> Memulai...</> : <><IconDownload /> {isVideoPlaylist ? "Download playlist" : "Download video"}</>}
             </button>
-            {busy && activeJobId && viewKind === "video" && (
-              <button type="button" className="btn danger-ghost" onClick={cancelJob} disabled={cancelling}>
-                <IconStop /> {cancelling ? "Membatalkan..." : "Batalkan"}
-              </button>
-            )}
           </div>
+          {runningCount > 0 && <div className="inline-hint" style={{ marginTop: 10 }}>{runningCount} unduhan berjalan — tambah lagi? Bisa!</div>}
         </form>
       )}
         </div>
 
         <div className="col-results" ref={resultsRef}>
-      {/* ---------- PANEL HASIL ---------- */}
-      {hasResults ? (
+      {hasJobs ? (
         <>
-          {/* Hero + progress keseluruhan */}
-          {viewKind === "music" && overall && (
-            <div className="progress-card">
-              <div className="hero">
-                <div className="hero-art">
-                  {playlistCover
-                    ? <img src={playlistCover} alt="" referrerPolicy="no-referrer" />
-                    : <span className="hero-art-fallback"><IconMusic size={26} /></span>}
-                </div>
-                <div className="hero-info">
-                  <span className="hero-kind">{typeLabel}</span>
-                  <div className="hero-name">{playlistName || "Mengunduh..."}</div>
-                  <div className="hero-sub">
-                    {overall.completed}/{overall.total} lagu selesai
-                    {destFolder && <> · ke folder <b>{pathTail(destFolder)}</b></>}
-                    {jobOutcome === "cancelled" && " · dibatalkan"}
-                  </div>
-                </div>
-                <div className="pct-big">{pct}<small>%</small></div>
-              </div>
-              <div className="bar"><div className="bar-fill" style={{ width: `${pct}%` }} /></div>
-              <div className="hero-stats">
-                {elapsed > 0 && <span>{fmtTime(elapsed)} berjalan</span>}
-                {overallEta !== null && <span>sisa ± {fmtTime(overallEta)}</span>}
-                {summary && <span>selesai dalam {fmtTime(summary.durationMs / 1000)}</span>}
-              </div>
+          {runningCount > 0 && (
+            <div className="active-banner">
+              <span className="dot ok" /> {runningCount} unduhan aktif — kamu bisa mulai unduhan baru tanpa menunggu
             </div>
           )}
-
-          {/* Video preview + progress */}
-          {viewKind === "video" && videoInfo && (
-            <div className="video-preview">
-              {videoInfo.thumbnailUrl && <img className="video-thumb" src={videoInfo.thumbnailUrl} alt="" referrerPolicy="no-referrer" />}
-              <div className="video-meta">
-                <div className="t">{videoInfo.title}</div>
-                <div className="s">
-                  {[videoInfo.channel, fmtTime(videoInfo.durationSec ?? null)].filter(Boolean).join(" · ") ||
-                    "Mengambil info video..."}
-                </div>
-              </div>
-            </div>
-          )}
-          {viewKind === "video" && videoProgress && !videoResult && (
-            <div className="progress-card">
-              <div className="progress-top">
-                <span>Mengunduh video</span>
-                <span className="pct">{videoProgress.percent !== null ? `${Math.round(videoProgress.percent)}%` : "..."}</span>
-              </div>
-              {videoProgress.percent !== null ? (
-                <div className="bar"><div className="bar-fill" style={{ width: `${videoProgress.percent}%` }} /></div>
-              ) : (
-                <div className="bar indeterminate" />
-              )}
-              <div className="hero-stats">
-                {videoProgress.speedBps ? <span>{fmtSpeed(videoProgress.speedBps)}</span> : null}
-                {videoProgress.etaSec ? <span>sisa ± {fmtTime(videoProgress.etaSec)}</span> : null}
-                {videoProgress.totalBytes ? <span>{fmtBytes(videoProgress.totalBytes)}</span> : null}
-                {cancelling && <span>Membatalkan...</span>}
-              </div>
-            </div>
-          )}
-          {viewKind === "video" && videoResult && (
-            <div className="queue">
-              <div className="queue-head">
-                <div>
-                  <div className="queue-title">{videoResult.skipped ? "Video sudah pernah diunduh" : "Video selesai diunduh"}</div>
-                  <div className="queue-sub">{videoResult.outputPath}</div>
-                </div>
-                <button type="button" className="btn ghost" onClick={() => videoResult.outputPath && openFolder(videoResult.outputPath)}>
-                  Buka folder
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Queue rows */}
-          {viewKind === "music" && rows.length > 0 && (
-            <div className="queue">
-              <div className="queue-head">
-                <div>
-                  <div className="queue-title">Daftar lagu</div>
-                  <div className="queue-sub">
-                    {visibleRows.length === rows.length
-                      ? `${rows.length} lagu${summary ? ` · ${summary.succeeded} berhasil` : ""}`
-                      : `${visibleRows.length} dari ${rows.length} lagu`}
-                  </div>
-                </div>
-                {showQueueSearch && (
-                  <div className="queue-search">
-                    <IconSearch />
-                    <input
-                      type="text"
-                      value={queueFilter}
-                      onChange={(e) => setQueueFilter(e.target.value)}
-                      placeholder="Cari lagu..."
-                    />
-                  </div>
-                )}
-              </div>
-              {visibleRows.map((r, i) => (
-                <div key={`${r.index}-${r.title}`} className="qrow" style={{ animationDelay: `${Math.min(i * 25, 250)}ms` }}>
-                  {/* Cover + status overlay */}
-                  <div className={`thumb-wrap st-${r.state}`}>
-                    <div className="thumb-fallback"><IconMusic size={16} /></div>
-                    {r.coverArtUrl && (
-                      <img className="thumb" src={r.coverArtUrl} alt="" loading="lazy" referrerPolicy="no-referrer"
-                        onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = "hidden"; }} />
-                    )}
-                    <span className="thumb-badge">{<StatusGlyph state={r.state} />}</span>
-                  </div>
-
-                  <div className="qbody">
-                    <div className="qname" title={r.title}>{r.title}</div>
-                    <div className="qsub">
-                      {r.artists.length > 0 && <span>{r.artists.join(", ")}</span>}
-                      {r.durationSec ? <><span className="sep">·</span><span>{fmtTime(r.durationSec)}</span></> : null}
-                      {r.state === "downloading" && r.percent !== null && (
-                        <><span className="sep">·</span><span>{Math.round(r.percent)}%</span></>
-                      )}
-                      {r.state === "downloading" && r.speedBps ? <><span className="sep">·</span><span>{fmtSpeed(r.speedBps)}</span></> : null}
-                      {r.state === "downloading" && r.etaSec ? <><span className="sep">·</span><span>sisa {fmtTime(r.etaSec)}</span></> : null}
-                      {r.provider && r.state === "done" && (
-                        <><span className="sep">·</span><span>via {r.provider}</span></>
-                      )}
-                      {r.hasLyrics && <span className="tag accent">lirik</span>}
-                      {r.instrumental && <span className="tag info">instrumental</span>}
-                      {r.state === "skipped" && <span className="tag warn">sudah ada</span>}
-                      {r.state === "failed" && r.error && (
-                        <span className="err-text" title={r.error}>— {r.error.split("\n")[0]}</span>
-                      )}
-                    </div>
-                    {r.state === "downloading" && r.percent !== null && (
-                      <div className="minibar"><div className="minibar-fill" style={{ width: `${r.percent}%` }} /></div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Summary */}
-          {viewKind === "music" && summary && (
-            <>
-              <div className="summary-box">
-                <div className="stat ok"><b>{summary.succeeded}</b><span>Berhasil</span></div>
-                <div className="stat fail"><b>{summary.failed}</b><span>Gagal</span></div>
-                <div className="stat skip"><b>{summary.skipped}</b><span>Diskip</span></div>
-                <div className="stat"><b>{summary.total}</b><span>Total</span></div>
-              </div>
-              {destFolder && (
-                <div className="dest-row">
-                  <span className="dest-icon"><IconFolder /></span>
-                  <div className="dest-info">
-                    <div className="dest-label">Tersimpan di</div>
-                    <div className="dest-path" title={destFolder}>{destFolder}</div>
-                  </div>
-                  <button type="button" className="btn ghost" onClick={() => openFolder(destFolder)}>
-                    Buka folder
-                  </button>
-                </div>
-              )}
-            </>
-          )}
+          <div className="job-stack">
+            {orderedJobs.map((job) => (
+              <JobCardView key={job.id} job={job} />
+            ))}
+          </div>
         </>
       ) : (
-        /* Empty state: panduan singkat untuk user baru */
-        !busy && (
-          <div className="empty-state">
-            <div className="empty-art">
-              <span className="empty-note"><IconMusic size={30} /></span>
-              <span className="empty-arrow"><IconDownload /></span>
-            </div>
-            <h3>Belum ada unduhan</h3>
-            <div className="steps">
-              <div className="step"><span className="step-num">1</span><span>Buka Spotify atau YouTube, salin link lagu / playlist</span></div>
-              <div className="step"><span className="step-num">2</span><span>Tempel di panel sebelah kiri, pilih format</span></div>
-              <div className="step"><span className="step-num">3</span><span>Klik download — file rapi per playlist, lengkap cover & lirik</span></div>
-            </div>
+        <div className="empty-state">
+          <div className="empty-art">
+            <span className="empty-note"><IconMusic size={30} /></span>
+            <span className="empty-arrow"><IconDownload /></span>
           </div>
-        )
+          <h3>Belum ada unduhan</h3>
+          <div className="steps">
+            <div className="step"><span className="step-num">1</span><span>Buka Spotify atau YouTube, salin link lagu / playlist</span></div>
+            <div className="step"><span className="step-num">2</span><span>Tempel di panel kiri, pilih format & kualitas</span></div>
+            <div className="step"><span className="step-num">3</span><span>Klik download — tambah sebanyak mau, semua jalan paralel</span></div>
+          </div>
+        </div>
       )}
-
-      {/* Warnings & errors */}
-      {warnings.map((w, i) => (
-        <div key={i} className="warn-box"><IconWarn /> <span>{w}</span></div>
-      ))}
-      {errorMsg && <div className="error-box"><IconX /> <span>{errorMsg}</span></div>}
         </div>
       </div>
       </>
       )}
 
       <div className="footer">
-        Semua berjalan lokal di komputermu · tarik-lepas atau tempel link di mana saja
+        DROP berjalan lokal di komputermu · tarik-lepas atau tempel link di mana saja · tanpa batas antrian
       </div>
 
       <FolderPicker

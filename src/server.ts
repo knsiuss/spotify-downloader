@@ -19,7 +19,7 @@ import { allBinariesInfo } from "./lib/binaries.js";
 import { serveStatic, uiIsBuilt } from "./lib/static.js";
 import { initLogging, appDataDir } from "./lib/log.js";
 import { killAllChildren } from "./lib/procs.js";
-import { downloadVideo, getVideoInfo, isYouTubeUrl } from "./video/youtube-video.js";
+import { downloadVideo, getVideoInfo, isYouTubeUrl, isYouTubePlaylistUrl, getYouTubePlaylistInfo, downloadYouTubePlaylist } from "./video/youtube-video.js";
 import type { VideoResolution, VideoFormat } from "./video/youtube-video.js";
 import { fetchLyrics } from "./lyrics/lrclib.js";
 import { loadQobuzConfig } from "./providers/qobuz.js";
@@ -170,17 +170,76 @@ async function runMusicJob(job: Job, reqObj: DownloadRequest): Promise<void> {
   }
 }
 
-/** Runner job video YouTube. */
+/** Runner job video YouTube — support single video + playlist (tanpa batas). */
 async function runVideoJob(
   job: Job,
   params: { url: string; outputDir: string; resolution: VideoResolution; format: VideoFormat; cookiesFile?: string },
 ): Promise<void> {
   const emit = (e: { type: string; [key: string]: unknown }) => appendEvent(job, e);
 
-  // Info dulu supaya UI bisa menampilkan judul/thumbnail sebelum download jalan.
+  // Deteksi playlist: jika URL mengandung list=, coba ambil info playlist dulu.
+  if (isYouTubePlaylistUrl(params.url)) {
+    try {
+      const pl = await getYouTubePlaylistInfo(params.url);
+      if (pl.videos.length > 1) {
+        // === PLAYLIST PATH ===
+        job.label = pl.title || job.label;
+        job.meta = { name: pl.title, cover: pl.thumbnailUrl, formats: `${params.resolution}p ${params.format}` };
+        const folder = `${params.outputDir}/${pl.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")}`;
+        emit({
+          type: "start",
+          kind: "video-playlist",
+          total: pl.videos.length,
+          name: pl.title,
+          sourceType: "playlist",
+          cover: pl.thumbnailUrl,
+          folder,
+          tracks: pl.videos.map((v) => ({ id: v.id, title: v.title, artists: v.channel ? [v.channel] : [], durationSec: v.durationSec, coverArtUrl: v.thumbnailUrl })),
+        });
+        const activeSpeeds = new Map<number, number | null>();
+        let completedCount = 0;
+        const sumSpeeds = () => {
+          let sum = 0; let any = false;
+          for (const v of activeSpeeds.values()) { if (v && v > 0) { sum += v; any = true; } }
+          return any ? sum : null;
+        };
+        const result = await downloadYouTubePlaylist(params as any, pl, {
+          signal: job.signal,
+          onStage: (stage, index) => emit({ type: "track_stage", index, stage }),
+          onFileProgress: (p, index) => {
+            activeSpeeds.set(index, p.speedBps);
+            (job as any).progress = { completed: completedCount, total: pl.videos.length, speedBps: sumSpeeds() };
+            emit({ type: "track_progress", index, percent: p.percent, speedBps: p.speedBps, etaSec: p.etaSec, downloadedBytes: p.downloadedBytes, totalBytes: p.totalBytes });
+          },
+          onTrack: (r, index) => {
+            const ok = r.ok;
+            const skipped = r.error === "sudah ada";
+            emit({ type: "track", index, title: r.title, ok, provider: "youtube", error: r.error, hasLyrics: false, instrumental: false, outputPath: r.outputPath });
+          },
+          onProgress: (completed, total) => {
+            completedCount = completed;
+            (job as any).progress = { completed, total, speedBps: sumSpeeds() };
+            emit({ type: "progress", completed, total });
+          },
+        });
+        if (job.signal.aborted || result.error === "cancelled") {
+          finishJob(job, "cancelled", { type: "cancelled", summary: result as any }, { summary: { ...result } as any });
+        } else {
+          const summary = { total: result.count, succeeded: result.succeeded, failed: result.failed, skipped: result.skipped, outputPath: result.outputDir };
+          finishJob(job, "done", { type: "done", summary, reportPath: null }, { summary: summary as any });
+        }
+        return;
+      }
+    } catch (err) {
+      // fallback ke single video kalau playlist fetch gagal
+      console.warn("[video] playlist fetch gagal, fallback single:", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // === SINGLE VIDEO PATH (fallback) ===
   let info = null;
   try { info = await getVideoInfo(params.url); } catch { /* fallback: tanpa info */ }
-  emit({ type: "start", info });
+  emit({ type: "start", info, kind: "video-single" });
 
   const result = await downloadVideo(params, {
     signal: job.signal,
@@ -560,7 +619,7 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Spotify Downloader v${APP_VERSION} -> http://${HOST}:${PORT}`);
+  console.log(`DROP v${APP_VERSION} -> http://${HOST}:${PORT}`);
   console.log(`  UI  : ${uiIsBuilt() ? "built (web/out)" : "BELUM DI-BUILD - jalankan npm run build:web"}`);
   console.log(`  API : /api/download, /api/download/video, /api/jobs, /api/settings, /api/diagnostics`);
   console.log(`  Data: ${appDataDir()}`);

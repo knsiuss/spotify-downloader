@@ -1,7 +1,7 @@
 {
-  "name": "spotify-downloader",
+  "name": "drop-media-downloader",
   "version": "0.2.0",
-  "description": "Spotify playlist downloader -> WAV/FLAC/MP3 dari sumber eksternal (tanpa akun Spotify)",
+  "description": "DROP — Media Downloader: Spotify & YouTube ke WAV/FLAC/MP3 + MP4/WEBM/MKV (lokal, tanpa akun Spotify)",
   "type": "module",
   "bin": {
     "spotdlr": "./dist/cli/index.js"
