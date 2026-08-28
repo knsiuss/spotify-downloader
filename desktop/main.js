@@ -70,7 +70,19 @@ function maybeUpdateYtDlp(base) {
   })();
 }
 
+let serverLog = "";
 function startServer(port) {
+  const fs = require("node:fs");
+  // Pre-flight check: pastikan file server ada (sering gagal karena belum npm run build)
+  if (!fs.existsSync(SERVER_JS)) {
+    console.error(`[desktop] SERVER_JS tidak ditemukan: ${SERVER_JS}`);
+    console.error(`[desktop] Pastikan sudah jalankan: npm run build (dari root)`);
+  }
+  if (!fs.existsSync(WEB_DIR) || !fs.existsSync(path.join(WEB_DIR, "index.html"))) {
+    console.warn(`[desktop] WEB_DIR belum di-build: ${WEB_DIR}`);
+  }
+  console.log(`[desktop] spawn ${process.execPath} ${SERVER_JS}`);
+  console.log(`[desktop] BINS_DIR=${BINS_DIR} WEB_DIR=${WEB_DIR}`);
   const env = {
     ...process.env,
     ELECTRON_RUN_AS_NODE: "1",
@@ -79,11 +91,25 @@ function startServer(port) {
     SPOTDLR_WEB_DIR: WEB_DIR,
   };
   serverProc = spawn(process.execPath, [SERVER_JS], { env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-  serverProc.stdout.on("data", (d) => process.stdout.write("[server] " + d));
-  serverProc.stderr.on("data", (d) => process.stderr.write("[server] " + d));
-  serverProc.on("exit", (code) => {
-    console.log("[desktop] server exited:", code);
-    // Server mati mendadak (mis. port dipakai) -> tutup app supaya tidak jadi zombie window.
+  serverProc.stdout.on("data", (d) => {
+    const s = d.toString();
+    serverLog += s;
+    if (serverLog.length > 8000) serverLog = serverLog.slice(-8000);
+    process.stdout.write("[server] " + d);
+  });
+  serverProc.stderr.on("data", (d) => {
+    const s = d.toString();
+    serverLog += s;
+    if (serverLog.length > 8000) serverLog = serverLog.slice(-8000);
+    process.stderr.write("[server] " + d);
+  });
+  serverProc.on("error", (err) => {
+    console.error("[desktop] spawn error:", err);
+    serverLog += `\nspawn error: ${err.message}\n`;
+  });
+  serverProc.on("exit", (code, signal) => {
+    console.log(`[desktop] server exited: code=${code} signal=${signal}`);
+    if (serverLog) console.log(`[desktop] last serverLog:\n${serverLog.slice(-2000)}`);
     if (win && code !== 0) app.quit();
   });
 }
@@ -99,12 +125,19 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     const port = await freePort();
     const base = `http://127.0.0.1:${port}`;
+    console.log(`[desktop] freePort=${port} base=${base}`);
+    console.log(`[desktop] SERVER_JS=${SERVER_JS} exists=${require("node:fs").existsSync(SERVER_JS)}`);
+    console.log(`[desktop] WEB_DIR=${WEB_DIR} exists=${require("node:fs").existsSync(WEB_DIR)} uiBuilt=${require("node:fs").existsSync(path.join(WEB_DIR, "index.html"))}`);
 
     startServer(port);
     const ok = await waitServer(base);
     if (!ok) {
       const { dialog } = require("electron");
-      dialog.showErrorBox("DROP", "Server internal gagal start. Cek log di %APPDATA%\\spotify-downloader\\logs");
+      const tail = (serverLog || "").slice(-1200).trim() || "(tidak ada output server)";
+      const msg = `Server internal gagal start.\n\nBase: ${base}\nSERVER_JS: ${SERVER_JS}\nWEB_DIR: ${WEB_DIR}\n\nLog tail:\n${tail}\n\nCek log lengkap di %APPDATA%\\spotify-downloader\\logs`;
+      console.error("[desktop] waitServer failed, showing dialog");
+      console.error(msg);
+      dialog.showErrorBox("DROP", msg);
       app.quit();
       return;
     }
