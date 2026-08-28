@@ -1,0 +1,81 @@
+# ==========================================
+# Dependencies
+# ==========================================
+node_modules/
+*/node_modules/
+.pnp
+.pnp.js
+
+# ==========================================
+# Build Outputs & Bundles
+# ==========================================
+dist/
+*/dist/
+build/
+release/
+*/release/
+.next/
+*/.next/
+out/
+*/out/
+*.tsbuildinfo
+next-env.d.ts
+
+# ==========================================
+# Binary Tools & Executables (yt-dlp, ffmpeg, electron)
+# ==========================================
+bin/*.exe
+bin/*.zip
+bin/*.tar.gz
+bin/*.7z
+release/
+*.exe
+*.dll
+
+# ==========================================
+# Downloaded Audio Outputs & Temp Files
+# ==========================================
+output/
+*/output/
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.opus
+*.ogg
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+
+# ==========================================
+# Logs & Debugging
+# ==========================================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==========================================
+# OS & Editor Metadata
+# ==========================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ==========================================
+# Testing & Coverage
+# ==========================================
+coverage/
+.turbo/

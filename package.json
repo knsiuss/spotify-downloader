@@ -1,0 +1,27 @@
+{
+  "name": "spotify-downloader",
+  "version": "0.2.0",
+  "description": "Spotify playlist downloader -> WAV/FLAC/MP3 dari sumber eksternal (tanpa akun Spotify)",
+  "type": "module",
+  "bin": {
+    "spotdlr": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc && npm run build:web",
+    "build:web": "cd web && npx next build",
+    "dev": "tsx src/cli/index.ts",
+    "start": "node dist/server.js",
+    "server": "node dist/server.js",
+    "web": "cd web && npx next dev -p 3000",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/__tests__/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}
