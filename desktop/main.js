@@ -164,8 +164,21 @@ if (!gotLock) {
   });
 
   app.on("window-all-closed", () => {
-    // SIGTERM -> handler graceful di server membunuh semua child (yt-dlp/ffmpeg).
-    if (serverProc) serverProc.kill("SIGTERM");
+    // Windows: serverProc.kill("SIGTERM") = TerminateProcess — handler
+    // graceful server TIDAK sempat jalan, sehingga yt-dlp/ffmpeg jadi yatim
+    // dan terus berjalan. taskkill /T membunuh seluruh tree proses
+    // (server + semua child download) secara andal.
+    if (serverProc && serverProc.pid) {
+      if (process.platform === "win32") {
+        try {
+          spawn("taskkill", ["/pid", String(serverProc.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+        } catch {
+          serverProc.kill("SIGTERM");
+        }
+      } else {
+        serverProc.kill("SIGTERM");
+      }
+    }
     app.quit();
   });
 }

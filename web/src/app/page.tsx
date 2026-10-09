@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Fragment } from "react";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
 
@@ -78,6 +78,8 @@ interface JobCard {
   jobOutcome: "cancelled" | null;
   destFolder: string | null;
   queueFilter: string;
+  /** Daftar video/lagu disembunyikan (collapse) biar kartu nggak mendorong kartu lain ke bawah. */
+  collapsed?: boolean;
   // video single
   videoInfo: VideoInfoLite | null;
   videoProgress: { percent: number | null; speedBps: number | null; etaSec: number | null; totalBytes: number | null } | null;
@@ -119,6 +121,7 @@ const IconFolder = ({ size = 16 }: { size?: number }) => (
 const IconSun = () => <Svg size={16}><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" /></Svg>;
 const IconMoon = () => <Svg size={16}><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></Svg>;
 const IconChevron = () => <Svg size={14}><polyline points="9 18 15 12 9 6" /></Svg>;
+const IconChevronDown = () => <Svg size={14}><polyline points="6 9 12 15 18 9" /></Svg>;
 const IconTrash = () => <Svg size={14}><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></Svg>;
 
 function StatusGlyph({ state }: { state: RowState }) {
@@ -213,25 +216,32 @@ function FolderPicker({
     setRoot(r);
     return r;
   }
+  const navSeq = useRef(0);
   async function navigate(p: string) {
+    const seq = ++navSeq.current;
     setLoading(true);
     setErr("");
     try {
       const r = await (await fetch(`${BACKEND_URL}/api/fs/list?path=${encodeURIComponent(p)}`)).json();
+      if (seq !== navSeq.current) return; // respons lama terlambat — abaikan
       if (r.error) setErr(r.error);
       else setListing(r);
     } catch {
-      setErr("Tidak bisa membaca folder");
+      if (seq === navSeq.current) setErr("Tidak bisa membaca folder");
     }
-    setLoading(false);
+    if (seq === navSeq.current) setLoading(false);
   }
 
   useEffect(() => {
     if (!open) return;
     setErr(""); setCreating(false); setNewName("");
     (async () => {
-      const r = await loadRoot();
-      navigate(initial ?? r.home ?? "C:\\");
+      try {
+        const r = await loadRoot();
+        await navigate(initial ?? r.home ?? "C:\\");
+      } catch {
+        setErr("Tidak bisa membaca folder");
+      }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -349,8 +359,10 @@ function FolderPicker({
 export default function Home() {
   const [tab, setTab] = useState<Tab>("music");
 
-  // Theme
+  // Theme — default di state awal "light" (SSR-safe); nilai tersimpan diterapkan
+  // lewat effect dan HANYA ditulis balik ke localStorage setelah user mengganti.
   const [theme, setTheme] = useState<"light" | "dark">("light");
+  const themeTouchedRef = useRef(false);
 
   // Backend health
   const [healthOk, setHealthOk] = useState<boolean | null>(null);
@@ -386,6 +398,13 @@ export default function Home() {
   const controllersRef = useRef<Map<string, AbortController>>(new Map());
   const terminalsRef = useRef<Map<string, boolean>>(new Map());
 
+  // Unmount: abort semua stream event supaya tidak ada fetch/reader yatim
+  // yang terus berjalan dan memanggil setState di komponen yang sudah mati.
+  useEffect(() => () => {
+    controllersRef.current.forEach((c) => c.abort());
+    controllersRef.current.clear();
+  }, []);
+
   // Theme init + apply
   useEffect(() => {
     const saved = localStorage.getItem("theme") as "light" | "dark" | null;
@@ -394,7 +413,9 @@ export default function Home() {
   }, []);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem("theme", theme);
+    // Jangan timpa preferensi tersimpan saat mount (nilai default "light"
+    // bisa menghapus "dark" yang tersimpan kalau ditulis sebelum init effect).
+    if (themeTouchedRef.current) localStorage.setItem("theme", theme);
   }, [theme]);
 
   // Health poll
@@ -471,13 +492,17 @@ export default function Home() {
     }).catch(() => {});
   }
 
-  // Elapsed ticker untuk semua running jobs
+  // Elapsed ticker untuk semua running jobs.
+  // Interval dibuat sekali; cek hasRunning tiap tick supaya interval tidak
+  // di-reset terus oleh event progress (yang menyebabkan elapsed macet).
+  const hasRunningRef = useRef(false);
+  hasRunningRef.current = [...jobs.values()].some((j) => j.status === "running" || j.status === "starting");
   useEffect(() => {
-    const hasRunning = [...jobs.values()].some((j) => j.status === "running" || j.status === "starting");
-    if (!hasRunning) return;
-    const t = setInterval(() => setTick((x) => x + 1), 1000);
+    const t = setInterval(() => {
+      if (hasRunningRef.current) setTick((x) => x + 1);
+    }, 1000);
     return () => clearInterval(t);
-  }, [jobs]);
+  }, []);
 
   // History awal
   useEffect(() => { void refreshHistory(); }, []);
@@ -646,7 +671,12 @@ export default function Home() {
         }));
         break;
       case "warning":
-        updateJob(jobId, (j) => ({ ...j, warnings: [...j.warnings, String(msg.message)] }));
+        updateJob(jobId, (j) => {
+          const w = String(msg.message);
+          // Dedupe: event replay (reconnect/reopen history) tidak boleh
+          // menduplikasi kotak peringatan.
+          return j.warnings.includes(w) ? j : { ...j, warnings: [...j.warnings, w] };
+        });
         break;
       case "cancelling":
         updateJob(jobId, { cancelling: true });
@@ -717,9 +747,14 @@ export default function Home() {
       if (buf.trim()) {
         try { applyEvent(jobId, JSON.parse(buf)); } catch { }
       }
-      if (!terminalsRef.current.get(jobId) && attempt < 5) {
-        await new Promise((r) => setTimeout(r, 1200));
-        if (!ctrl.signal.aborted) return streamEvents(jobId, attempt + 1);
+      if (!terminalsRef.current.get(jobId)) {
+        if (attempt < 5) {
+          await new Promise((r) => setTimeout(r, 1200));
+          if (!ctrl.signal.aborted) return streamEvents(jobId, attempt + 1);
+        }
+        // Stream tertutup bersih tanpa event terminal & retry habis —
+        // jangan biarkan card menggantung "running" selamanya.
+        updateJob(jobId, { status: "error", errorMsg: "Koneksi ke server terputus" });
       }
     } catch (err) {
       if (!ctrl.signal.aborted && !terminalsRef.current.get(jobId) && attempt < 5) {
@@ -730,7 +765,9 @@ export default function Home() {
         updateJob(jobId, { status: "error", errorMsg: err instanceof Error ? err.message : "Stream terputus" });
       }
     } finally {
-      controllersRef.current.delete(jobId);
+      // Hapus controller hanya kalau masih milik invokasi ini — invokasi
+      // reconnect sudah mendaftarkan controller barunya, jangan ikut terhapus.
+      if (controllersRef.current.get(jobId) === ctrl) controllersRef.current.delete(jobId);
     }
   }
 
@@ -831,8 +868,13 @@ export default function Home() {
   async function cancelJob(jobId: string) {
     updateJob(jobId, { cancelling: true });
     try {
-      await fetch(`${BACKEND_URL}/api/jobs/${jobId}`, { method: "DELETE" });
-    } catch { }
+      const res = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`, { method: "DELETE" });
+      // Gagal cancel (server down / job sudah selesai) — reset supaya tombol
+      // tidak terjebak "Membatalkan..." selamanya.
+      if (!res.ok) updateJob(jobId, { cancelling: false });
+    } catch {
+      updateJob(jobId, { cancelling: false });
+    }
   }
 
   function dismissJob(jobId: string) {
@@ -888,8 +930,12 @@ export default function Home() {
     });
     setJobOrder((prev) => (prev.includes(item.id) ? prev : [item.id, ...prev]));
     setNavView("download");
-    terminalsRef.current.set(item.id, false);
-    void streamEvents(item.id);
+    // Guard: kalau stream live untuk job ini sudah jalan, jangan buka stream
+    // kedua — dua consumer paralel menduplikasi event & merusak abort/cancel.
+    if (!controllersRef.current.has(item.id)) {
+      terminalsRef.current.set(item.id, false);
+      void streamEvents(item.id);
+    }
     setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
   }
 
@@ -980,25 +1026,62 @@ export default function Home() {
             )}
           </div>
 
+          {job.rows.length === 0 && isRunning && (
+            <div className="queue">
+              <div className="queue-head">
+                <div>
+                  <div className="queue-title">Menyiapkan {job.kind === "video" ? "daftar video" : "daftar lagu"}…</div>
+                  <div className="queue-sub">Mengambil metadata dari {job.kind === "video" ? "YouTube" : "Spotify"}</div>
+                </div>
+                <span className="spinner" />
+              </div>
+              <div className="queue-rows">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <div className="qrow" key={i}>
+                    <div className="thumb-wrap"><div className="skeleton thumb-skel" /></div>
+                    <div className="qbody">
+                      <div className="skeleton skel-line" style={{ width: `${58 - (i % 3) * 9}%` }} />
+                      <div className="skeleton skel-line skel-sub" style={{ width: `${34 - (i % 2) * 7}%` }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {job.rows.length > 0 && (
             <div className="queue">
               <div className="queue-head">
                 <div>
                   <div className="queue-title">{job.kind === "video" ? "Daftar video" : "Daftar lagu"}</div>
                   <div className="queue-sub">
-                    {visibleRows.length === job.rows.length
-                      ? `${job.rows.length} ${job.kind === "video" ? "video" : "lagu"}${job.summary ? ` · ${(job.summary as any).succeeded ?? 0} berhasil` : ""}`
-                      : `${visibleRows.length} dari ${job.rows.length}`}
+                    {job.collapsed
+                      ? `${job.rows.length} ${job.kind === "video" ? "video" : "lagu"} disembunyikan${job.summary ? ` · ${(job.summary as any).succeeded ?? 0} berhasil` : ""}`
+                      : visibleRows.length === job.rows.length
+                        ? `${job.rows.length} ${job.kind === "video" ? "video" : "lagu"}${job.summary ? ` · ${(job.summary as any).succeeded ?? 0} berhasil` : ""}`
+                        : `${visibleRows.length} dari ${job.rows.length}`}
                   </div>
                 </div>
-                {showQueueSearch && (
-                  <div className="queue-search">
-                    <IconSearch />
-                    <input type="text" value={job.queueFilter} onChange={(e) => updateJob(job.id, { queueFilter: e.target.value })} placeholder="Cari..." />
-                  </div>
-                )}
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {showQueueSearch && !job.collapsed && (
+                    <div className="queue-search">
+                      <IconSearch />
+                      <input type="text" value={job.queueFilter} onChange={(e) => updateJob(job.id, { queueFilter: e.target.value })} placeholder="Cari..." />
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    className="icon-btn queue-toggle"
+                    onClick={() => updateJob(job.id, { collapsed: !job.collapsed })}
+                    aria-label={job.collapsed ? "Tampilkan daftar" : "Sembunyikan daftar"}
+                    title={job.collapsed ? "Tampilkan daftar" : "Sembunyikan daftar"}
+                  >
+                    <span className={`queue-chevron ${job.collapsed ? "closed" : ""}`}><IconChevronDown /></span>
+                  </button>
+                </div>
               </div>
-              {visibleRows.map((r, i) => (
+              {!job.collapsed && (
+                <div className="queue-rows">
+                  {visibleRows.map((r, i) => (
                 <div key={`${r.index}-${r.title}`} className={`qrow st-${r.state}`} style={{ animationDelay: `${Math.min(i * 22, 280)}ms` }}>
                   <div className={`thumb-wrap st-${r.state}`}>
                     <div className="thumb-fallback"><IconMusic size={16} /></div>
@@ -1028,6 +1111,8 @@ export default function Home() {
                   </div>
                 </div>
               ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -1152,7 +1237,7 @@ export default function Home() {
               <span className={`dot ${healthOk === null ? "wait" : healthOk ? "ok" : "bad"}`} />
               {healthOk === null ? "Memeriksa..." : healthOk ? "Siap" : "Offline"}
             </div>
-            <button className="icon-btn" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="Ganti tema">
+            <button className="icon-btn" onClick={() => { themeTouchedRef.current = true; setTheme(theme === "dark" ? "light" : "dark"); }} aria-label="Ganti tema">
               {theme === "dark" ? <IconSun /> : <IconMoon />}
             </button>
           </div>
@@ -1280,7 +1365,7 @@ export default function Home() {
           </div>
 
           <div className="actions">
-            <button type="submit" className="btn" disabled={!urlValid || formats.size === 0 || submitting === "music"}>
+            <button type="submit" className="btn primary" disabled={!urlValid || formats.size === 0 || submitting === "music"}>
               {submitting === "music" ? <><span className="spinner" /> Memulai...</> : <><IconDownload /> Download musik</>}
             </button>
           </div>
@@ -1341,7 +1426,7 @@ export default function Home() {
           </div>
 
           <div className="actions">
-            <button type="submit" className="btn" disabled={!videoUrlValid || submitting === "video"}>
+            <button type="submit" className="btn primary" disabled={!videoUrlValid || submitting === "video"}>
               {submitting === "video" ? <><span className="spinner" /> Memulai...</> : <><IconDownload /> {isVideoPlaylist ? "Download playlist" : "Download video"}</>}
             </button>
           </div>
@@ -1360,7 +1445,11 @@ export default function Home() {
           )}
           <div className="job-stack">
             {orderedJobs.map((job) => (
-              <JobCardView key={job.id} job={job} />
+              // Dipanggil sebagai fungsi render (bukan <JobCardView/>) supaya
+              // tipe elemen stabil antar update progress — tanpa ini, setiap
+              // event progress me-remount seluruh card dan animasi CSS
+              // entrance (rise/fade) diputar ulang → UI tampak glitch/kedip.
+              <Fragment key={job.id}>{JobCardView({ job })}</Fragment>
             ))}
           </div>
         </>

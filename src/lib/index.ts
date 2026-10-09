@@ -90,6 +90,22 @@ function isRetryable(result: DownloadResult): boolean {
   return result.errorCategory === "network" || result.errorCategory === "rate-limit" || result.errorCategory === "provider";
 }
 
+// Cooldown global saat batch kena rate-limit: worker lain ikut mengendur
+// supaya tidak stampede (semua retry barengan justru makin memicu 429).
+let rateLimitCooldownUntil = 0;
+const RATE_LIMIT_BASE_BACKOFF_MS = 15_000;
+const RATE_LIMIT_MAX_BACKOFF_MS = 60_000;
+
+/** Sleep yang bisa diputus oleh signal (dibatalkan = resolve lebih awal). */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const onAbort = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /** Proses satu track dengan retry. */
 async function processWithRetry(
   track: Track,
@@ -115,8 +131,14 @@ async function processWithRetry(
     // Retry hanya untuk error transient, bukan "no match", "format", atau "cancelled"
     if (!isRetryable(result)) break;
     if (attempt < retries) {
-      // Backoff: 1s, 2s, 4s... (dipotong pendek kalau dibatalkan)
-      await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+      // Rate-limit butuh backoff jauh lebih panjang + menahan seluruh batch;
+      // error transient lain cukup backoff pendek.
+      if (result.errorCategory === "rate-limit") {
+        rateLimitCooldownUntil = Math.max(rateLimitCooldownUntil, Date.now() + RATE_LIMIT_BASE_BACKOFF_MS);
+      }
+      const base = result.errorCategory === "rate-limit" ? RATE_LIMIT_BASE_BACKOFF_MS : 1000;
+      const wait = Math.min(base * 2 ** attempt, RATE_LIMIT_MAX_BACKOFF_MS);
+      await sleep(wait, opts.signal);
       if (opts.signal?.aborted) break;
     }
   }
@@ -181,6 +203,11 @@ export async function downloadTracks(
 
   async function worker() {
     while (idx < tracks.length && !signal?.aborted) {
+      // Tunda track baru selama cooldown rate-limit aktif (semua worker
+      // mengendur, bukan cuma yang kena) — cegah stampede.
+      const cooldown = rateLimitCooldownUntil - Date.now();
+      if (cooldown > 0) await sleep(cooldown, signal);
+      if (signal?.aborted) break;
       const i = idx++;
       const result = await processWithRetry(
         tracks[i],

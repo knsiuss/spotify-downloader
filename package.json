@@ -1,13 +1,13 @@
 {
   "name": "drop-media-downloader",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DROP — Media Downloader: Spotify & YouTube ke WAV/FLAC/MP3 + MP4/WEBM/MKV (lokal, tanpa akun Spotify)",
   "type": "module",
   "bin": {
     "spotdlr": "./dist/cli/index.js"
   },
   "scripts": {
-    "build": "tsc && npm run build:web",
+    "build": "tsc && node scripts/write-server-pkg.mjs && npm run build:web",
     "build:web": "cd web && npx next build",
     "dev": "tsx src/cli/index.ts",
     "start": "node dist/server.js",

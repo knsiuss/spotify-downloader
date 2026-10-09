@@ -47,10 +47,12 @@ export function serveStatic(req: import("node:http").IncomingMessage, res: impor
     return true;
   }
 
-  // Cegah path traversal: hasil resolve wajib masih di dalam web/out.
+  // Cegah path traversal: hasil resolve wajib tetap DI DALAM web/out.
+  // Bandingkan dengan pemisah — tanpa ini "web/out2" lolos prefix "web/out".
+  const rootAbs = path.resolve(root);
   const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "").replace(/\/+$/, "");
   let filePath = path.resolve(root, rel);
-  if (!filePath.startsWith(path.resolve(root))) {
+  if (filePath !== rootAbs && !filePath.startsWith(rootAbs + path.sep)) {
     res.writeHead(403);
     res.end();
     return true;

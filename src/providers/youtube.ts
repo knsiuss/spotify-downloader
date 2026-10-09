@@ -18,14 +18,49 @@ export interface RunYtDlpOptions {
   onLine?: (line: string) => void;
 }
 
+// ---- Anti rate-limit (terpusat untuk SEMUA pemanggilan yt-dlp) ----
+// Diverifikasi tersedia di yt-dlp 2026.08.19 (bin/yt-dlp.exe --help).
+// Tujuan: kurangi burst request ke YouTube yang memicu 429 / "Sign in to
+// confirm you're not a bot", tanpa perlu cookies/akun.
+const YT_PACING_FLAGS = [
+  "--sleep-requests", "0.6", // jeda antar request HTTP saat ekstraksi metadata
+  "--retries", "6", // yt-dlp retry sendiri error transient
+  "--retry-sleep", "http:exp=1:20", // backoff eksponensial khusus HTTP (429/503)
+  "--extractor-retries", "3",
+];
+
+// Gate jeda minimum antar spawn proses yt-dlp, lintas semua worker paralel &
+// provider. Tanpa ini, worker paralel bisa menembak YouTube bersamaan
+// (stampede) — penyebab utama kena rate limit.
+const MIN_SPAWN_GAP_MS = Math.max(0, Number(process.env.DROP_YT_MIN_GAP_MS ?? 1400));
+let spawnChain: Promise<void> = Promise.resolve();
+let lastSpawnAt = 0;
+
+/** Ambil satu "slot" spawn: tunggu sampai jeda minimum + jitter terpenuhi. */
+function acquireSpawnSlot(): Promise<void> {
+  const run = spawnChain.then(async () => {
+    const jitter = Math.random() * 400; // acak supaya request tidak berirama
+    const wait = Math.max(0, MIN_SPAWN_GAP_MS + jitter - (Date.now() - lastSpawnAt));
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastSpawnAt = Date.now();
+  });
+  // Jaga chain tetap hidup walau satu waiter gagal.
+  spawnChain = run.catch(() => {});
+  return run;
+}
+
 /**
  * Jalankan yt-dlp dan kumpulkan stdout.
  * Kompatibel dengan pemanggilan lama: runYtDlp(args, timeoutMsNumber).
  */
-export function runYtDlp(args: string[], options: RunYtDlpOptions | number = {}): Promise<string> {
+export async function runYtDlp(args: string[], options: RunYtDlpOptions | number = {}): Promise<string> {
   const opts: RunYtDlpOptions = typeof options === "number" ? { timeoutMs: options } : options;
+  // Jeda antar spawn lebih dulu supaya worker paralel tidak nembak bersamaan.
+  // Kalau sudah dibatalkan, lewati gate (proses langsung dibunuh di bawah).
+  if (!opts.signal?.aborted) await acquireSpawnSlot();
+  const fullArgs = [...YT_PACING_FLAGS, ...args];
   return new Promise((resolve, reject) => {
-    const child = trackChild(spawn(resolveBinary("yt-dlp"), args, { windowsHide: true }));
+    const child = trackChild(spawn(resolveBinary("yt-dlp"), fullArgs, { windowsHide: true }));
     let out = "";
     let err = "";
 
@@ -129,8 +164,6 @@ export class YouTubeProvider implements Provider {
     // Pakai ejs (node) saja + android/web client — cukup untuk bestaudio/best.
     // Kalau user kena 403, bisa pakai --cookies.
     const args = [
-      "--extractor-args",
-      "youtube:player_client=android,web",
       "--js-runtimes",
       "node",
     ];

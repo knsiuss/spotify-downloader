@@ -91,7 +91,13 @@ describe("audio pipeline", () => {
     const out = await transcode(path.join(TMP, "src.m4a"), "mp3", path.join(TMP, "out-lyr"), undefined, meta);
     const raw = execSync(`ffprobe -v error -show_entries format_tags -of json "${out}"`, { encoding: "utf8" });
     const tags = JSON.parse(raw).format?.tags ?? {};
-    assert.match(String(tags.lyrics ?? ""), /Bait dua/);
+    // Kunci tag USLT beda antar versi ffprobe: "lyrics" (lama) vs "lyrics-und"/
+    // "lyrics-eng" (baru, menyertakan bahasa frame). Terima keduanya.
+    const lyricsValue = Object.entries(tags)
+      .filter(([k]) => k === "lyrics" || k.startsWith("lyrics-"))
+      .map(([, v]) => String(v))
+      .join("\n");
+    assert.match(lyricsValue, /Bait dua/);
   });
 
   it("buildId3Tag: struktur header & frame valid", () => {

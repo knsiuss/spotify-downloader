@@ -27,13 +27,20 @@ import { loadQobuzConfig } from "./providers/qobuz.js";
 initLogging();
 
 // Version dibaca sekali dari package.json di root project (bukan hardcode biar tidak drift).
+// Saat ter-paket, dist/package.json (sibling, ditulis oleh scripts/write-server-pkg.mjs)
+// jadi sumber utama; root package.json dipakai untuk dev.
 const APP_VERSION = (() => {
-  try {
-    const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-    return String(JSON.parse(fs.readFileSync(pkgPath, "utf8")).version ?? "unknown");
-  } catch {
-    return "unknown";
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  for (const candidate of [
+    path.join(here, "package.json"),
+    path.join(here, "..", "package.json"),
+  ]) {
+    try {
+      return String(JSON.parse(fs.readFileSync(candidate, "utf8")).version ?? "unknown");
+    } catch { /* coba kandidat berikutnya */
+    }
   }
+  return "unknown";
 })();
 
 process.on("uncaughtException", (err) => {
@@ -155,7 +162,10 @@ async function runMusicJob(job: Job, reqObj: DownloadRequest): Promise<void> {
         hasLyrics: Boolean(r.lyricsEmbedded), instrumental: Boolean(r.instrumental),
         outputPath: r.outputPath,
       }),
-    onProgress: (completed, total) => emit({ type: "progress", completed, total }),
+    onProgress: (completed, total) => {
+      completedCount = completed;
+      emit({ type: "progress", completed, total });
+    },
     onWarning: (message) => emit({ type: "warning", message }),
   });
 

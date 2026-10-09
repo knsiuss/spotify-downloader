@@ -56,22 +56,24 @@ export function parseYouTubePlaylistId(url: string): string | null {
   return m ? m[1] : null;
 }
 
-/** Build yt-dlp format selector untuk resolution tertentu. */
+/** Build yt-dlp format selector untuk resolution tertentu.
+ * Tidak memfilter codec/container — biarkan `-S` (format-sort) yang memilih
+ * bitrate TERTINGGI pada resolusi target (bukan codec tertentu). */
 export function buildVideoFormat(resolution: VideoResolution, format: VideoFormat): string {
+  if (resolution === "best") return "bestvideo+bestaudio/best";
+  const h = parseInt(resolution, 10);
+  return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`;
+}
+
+/** Build yt-dlp `-S` format-sort: resolusi target dulu, lalu BITRATE MAKSIMAL.
+ * Untuk webm, codec diurutkan dulu (VP9/AV1) supaya hasil merge tetap
+ * kompatibel dengan container webm (H.264 tidak bisa di-mux ke webm). */
+export function buildVideoSort(resolution: VideoResolution, format: VideoFormat): string {
   if (resolution === "best") {
-    // best video+audio, prefer mp4
-    if (format === "mp4") return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best";
-    if (format === "webm") return "bestvideo[ext=webm]+bestaudio/bestvideo+bestaudio/best";
-    return "bestvideo+bestaudio/best";
+    return format === "webm" ? "vcodec,br" : "res,br";
   }
   const h = parseInt(resolution, 10);
-  if (format === "mp4") {
-    return `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}][ext=mp4]/best[height<=${h}]`;
-  }
-  if (format === "webm") {
-    return `bestvideo[height<=${h}][ext=webm]+bestaudio/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`;
-  }
-  return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`;
+  return format === "webm" ? `res:${h},vcodec,br` : `res:${h},br`;
 }
 
 export interface YouTubePlaylistInfo {
@@ -100,7 +102,6 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
     "--no-download",
     "--print", "%(id)s\t%(title)s\t%(channel)s\t%(duration)s\t%(thumbnail)s",
     "--no-warnings",
-    "--extractor-args", "youtube:player_client=android,web",
     "--js-runtimes", "node",
   ];
   const out = await runYtDlp(args, 60_000);
@@ -123,7 +124,6 @@ export async function getYouTubePlaylistInfo(url: string): Promise<YouTubePlayli
     "--flat-playlist",
     "--dump-single-json",
     "--no-warnings",
-    "--extractor-args", "youtube:player_client=android,web",
     "--js-runtimes", "node",
   ];
   const out = await runYtDlp(args, 90_000);
@@ -169,6 +169,7 @@ export async function downloadVideo(
 
   const baseName = sanitizeFilename(info.title);
   const formatSel = buildVideoFormat(req.resolution, req.format);
+  const sortSel = buildVideoSort(req.resolution, req.format);
 
   // File name include resolution biar 360p vs 1080p gak dianggap sama
   const fileBase = `${baseName} [${req.resolution}p]`;
@@ -181,11 +182,11 @@ export async function downloadVideo(
   const args = [
     req.url,
     "-f", formatSel,
+    "-S", sortSel,
     "--merge-output-format", req.format,
     "--no-playlist",
     "-o", outTemplate,
     "--no-warnings",
-    "--extractor-args", "youtube:player_client=android,web",
     "--js-runtimes", "node",
   ];
   if (req.cookiesFile) args.push("--cookies", req.cookiesFile);
@@ -244,6 +245,7 @@ export async function downloadYouTubePlaylist(
   const playlistDir = path.join(req.outputDir, sanitizeFilename(playlist.title));
   fs.mkdirSync(playlistDir, { recursive: true });
   const formatSel = buildVideoFormat(req.resolution, req.format);
+  const sortSel = buildVideoSort(req.resolution, req.format);
   let succeeded = 0, failed = 0, skipped = 0;
 
   for (let i = 0; i < playlist.videos.length; i++) {
@@ -269,11 +271,11 @@ export async function downloadYouTubePlaylist(
     const args = [
       videoUrl,
       "-f", formatSel,
+      "-S", sortSel,
       "--merge-output-format", req.format,
       "--no-playlist",
       "-o", outTemplate,
       "--no-warnings",
-      "--extractor-args", "youtube:player_client=android,web",
       "--js-runtimes", "node",
     ];
     if (req.cookiesFile) args.push("--cookies", req.cookiesFile);
