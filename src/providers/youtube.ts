@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import path from "node:path";
 import { resolveBinary } from "../lib/binaries.js";
-import { trackChild } from "../lib/procs.js";
+import { trackChild, killProcessTree } from "../lib/procs.js";
 import type { Candidate, FileProgress, Provider, ProviderContext, Track } from "../core/types.js";
 
 export interface RunYtDlpOptions {
@@ -65,7 +65,9 @@ export async function runYtDlp(args: string[], options: RunYtDlpOptions | number
     let err = "";
 
     const killAndReject = (message: string) => {
-      child.kill("SIGKILL");
+      // Tree kill: selain yt-dlp, ffmpeg hasil merge juga ikut mati supaya
+      // tidak ada grandchild yang menulis file setelah job dinyatakan gagal.
+      killProcessTree(child);
       reject(new Error(message));
     };
 
@@ -101,6 +103,30 @@ export async function runYtDlp(args: string[], options: RunYtDlpOptions | number
       else reject(new Error(`yt-dlp exit ${code}: ${err.slice(-500)}`));
     });
   });
+}
+
+/** Error yang benar-benar tidak bisa diatasi dengan mengulang (video hilang/privat/members-only). */
+const FATAL_YT_PATTERNS = [
+  "video unavailable",
+  "private video",
+  "removed by the uploader",
+  "account associated with this video has been terminated",
+  "not available in your country",
+  "sign in to confirm your age",
+  "this video is available to this channel's members",
+  "join this channel to help support it",
+  "premieres in",
+];
+
+/**
+ * Layak diulang dari luar yt-dlp? Timeout jaringan dan HTTP 403/429/5xx sering
+ * hilang sendiri: URL media YouTube berumur pendek, jadi ekstraksi ulang
+ * menghasilkan URL segar. Error fatal (video dihapus/privat) tidak.
+ */
+export function isRetryableYtDlpError(message: string): boolean {
+  if (message === "cancelled") return false;
+  const lower = message.toLowerCase();
+  return !FATAL_YT_PATTERNS.some((pattern) => lower.includes(pattern));
 }
 
 const UNITS: Record<string, number> = { KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3 };

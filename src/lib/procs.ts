@@ -3,6 +3,7 @@
 // child process yatim terus jalan tanpa orang tua. Semua spawn eksternal
 // wajib lewat trackChild supaya bisa dibunuh massal saat shutdown.
 
+import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 
 const children = new Set<ChildProcess>();
@@ -18,10 +19,29 @@ export function trackedCount(): number {
   return children.size;
 }
 
+/**
+ * Bunuh proses beserta seluruh turunannya (Windows: `taskkill /T /F`).
+ * Penting untuk yt-dlp: dia menjalankan ffmpeg sebagai grandchild, dan
+ * SIGKILL ke yt-dlp saja meninggalkan ffmpeg yang tetap menulis file hasil
+ * merge SETELAH job dilaporkan gagal.
+ */
+export function killProcessTree(child: ChildProcess): void {
+  try {
+    if (process.platform === "win32" && child.pid) {
+      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      }).unref();
+      return;
+    }
+    child.kill("SIGKILL");
+  } catch { /* proses sudah mati */ }
+}
+
 /** Bunuh semua child yang masih hidup (dipakai saat shutdown/crash). */
 export function killAllChildren(): void {
   for (const c of children) {
-    try { c.kill("SIGKILL"); } catch { /* sudah mati */ }
+    killProcessTree(c);
   }
   children.clear();
 }

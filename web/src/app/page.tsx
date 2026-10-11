@@ -87,6 +87,10 @@ interface JobCard {
   warnings: string[];
   errorMsg: string;
   cancelling: boolean;
+  /** Percobaan ulang terakhir (yt-dlp gagal sekali, sedang menyambung dari titik berhenti). */
+  retryInfo: { attempt: number; maxAttempts: number; error: string; index?: number } | null;
+  /** Parameter request video — dipakai tombol "Coba lagi" untuk resume. */
+  request: { url: string; resolution: string; format: string; outputDir: string } | null;
 }
 
 // ---------------- Icons ----------------
@@ -172,6 +176,11 @@ function pathTail(p: string): string {
 function dirname(p: string): string {
   const i = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
   return i > 0 ? p.slice(0, i) : p;
+}
+/** Baris terakhir error yt-dlp (mis. "ERROR: unable to download video data: HTTP Error 403"). */
+function lastErrorLine(msg: string): string {
+  const lines = msg.split("\n").map((l) => l.trim()).filter(Boolean);
+  return (lines[lines.length - 1] ?? msg).slice(0, 120);
 }
 
 const SPOTIFY_RE = /(open\.spotify\.com\/(track|album|playlist)|spotify:(track|album|playlist):[A-Za-z0-9]+)/;
@@ -538,6 +547,10 @@ export default function Home() {
       warnings: [],
       errorMsg: "",
       cancelling: false,
+      retryInfo: null,
+      request: kind === "video"
+        ? { url: videoUrl.trim(), resolution, format: videoFormat, outputDir: videoOutputDir.trim() }
+        : null,
     };
   }
 
@@ -579,6 +592,7 @@ export default function Home() {
             next.set(jobId, {
               ...cur,
               status: "running",
+              retryInfo: null,
               videoInfo: msg.info ? { id: String(msg.info.id ?? ""), title: String(msg.info.title ?? "Video"), channel: String(msg.info.channel ?? ""), durationSec: msg.info.durationSec ?? null, thumbnailUrl: msg.info.thumbnailUrl ?? null } : cur.videoInfo,
               playlistName: msg.info?.title ?? cur.playlistName,
               playlistCover: msg.info?.thumbnailUrl ?? cur.playlistCover,
@@ -670,6 +684,19 @@ export default function Home() {
           },
         }));
         break;
+      case "video_retry":
+      case "track_retry":
+        // Percobaan diulang: tampilkan catatan + dari mana dia menyambung.
+        updateJob(jobId, {
+          status: "running",
+          retryInfo: {
+            attempt: Number(msg.attempt ?? 1),
+            maxAttempts: Number(msg.maxAttempts ?? 3),
+            error: String(msg.error ?? ""),
+            index: msg.index !== undefined ? Number(msg.index) : undefined,
+          },
+        });
+        break;
       case "warning":
         updateJob(jobId, (j) => {
           const w = String(msg.message);
@@ -697,6 +724,7 @@ export default function Home() {
             next.set(jobId, {
               ...cur,
               status: "done",
+              retryInfo: null,
               videoResult: { outputPath: String(msg.outputPath ?? ""), skipped: Boolean(msg.skipped) },
               summary: { outputPath: String(msg.outputPath ?? ""), total: 1, succeeded: msg.skipped ? 0 : 1, failed: 0, skipped: msg.skipped ? 1 : 0 } as any,
             });
@@ -704,10 +732,11 @@ export default function Home() {
             next.set(jobId, {
               ...cur,
               status: "done",
+              retryInfo: null,
               summary: { ...(msg.summary as any), reportPath: (msg as any).reportPath ?? (msg.summary as any)?.reportPath ?? null },
             });
           } else {
-            next.set(jobId, { ...cur, status: "done" });
+            next.set(jobId, { ...cur, status: "done", retryInfo: null });
           }
           return next;
         });
@@ -715,7 +744,7 @@ export default function Home() {
         break;
       case "error":
         terminalsRef.current.set(jobId, true);
-        updateJob(jobId, { status: "error", errorMsg: String(msg.error ?? "Terjadi kesalahan") });
+        updateJob(jobId, { status: "error", errorMsg: String(msg.error ?? "Terjadi kesalahan"), retryInfo: null });
         void refreshHistory();
         break;
       default:
@@ -805,23 +834,50 @@ export default function Home() {
       });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.jobId) {
-        // buat card error sementara
-        const tmpId = `err-${Date.now()}`;
-        const card = createJobCard(tmpId, "music");
-        card.status = "error";
-        card.errorMsg = data?.error ?? `HTTP ${res.status}`;
-        setJobs((prev) => new Map(prev).set(tmpId, card));
-        setJobOrder((prev) => [tmpId, ...prev]);
+        showTempError("music", data?.error ?? `HTTP ${res.status}`);
         return;
       }
       await beginJob(data.jobId, "music");
     } catch {
-      const tmpId = `err-${Date.now()}`;
-      const card = createJobCard(tmpId, "music");
-      card.status = "error";
-      card.errorMsg = "Server belum jalan. Buka aplikasi lewat start.bat ya.";
-      setJobs((prev) => new Map(prev).set(tmpId, card));
-      setJobOrder((prev) => [tmpId, ...prev]);
+      showTempError("music", "Server belum jalan. Buka aplikasi lewat start.bat ya.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  function showTempError(kind: Tab, message: string) {
+    const tmpId = `err-${Date.now()}`;
+    const card = createJobCard(tmpId, kind);
+    card.status = "error";
+    card.errorMsg = message;
+    setJobs((prev) => new Map(prev).set(tmpId, card));
+    setJobOrder((prev) => [tmpId, ...prev]);
+  }
+
+  /** POST job video + buat kartunya. Return jobId, atau null kalau gagal. */
+  async function startVideoJob(params: { url: string; resolution: string; format: string; outputDir: string }): Promise<string | null> {
+    setSubmitting("video");
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/download/video`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: params.url,
+          resolution: params.resolution,
+          format: params.format,
+          outputDir: params.outputDir.trim() || undefined,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.jobId) {
+        showTempError("video", data?.error ?? `HTTP ${res.status}`);
+        return null;
+      }
+      await beginJob(data.jobId, "video");
+      return data.jobId;
+    } catch {
+      showTempError("video", "Server belum jalan. Buka aplikasi lewat start.bat ya.");
+      return null;
     } finally {
       setSubmitting(null);
     }
@@ -830,39 +886,23 @@ export default function Home() {
   async function submitVideo(e: React.FormEvent) {
     e.preventDefault();
     if (!videoUrlValid || submitting) return;
-    setSubmitting("video");
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/download/video`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: videoUrl.trim(),
-          resolution,
-          format: videoFormat,
-          outputDir: videoOutputDir.trim() || undefined,
-        }),
-      });
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data?.jobId) {
-        const tmpId = `err-${Date.now()}`;
-        const card = createJobCard(tmpId, "video");
-        card.status = "error";
-        card.errorMsg = data?.error ?? `HTTP ${res.status}`;
-        setJobs((prev) => new Map(prev).set(tmpId, card));
-        setJobOrder((prev) => [tmpId, ...prev]);
-        return;
-      }
-      await beginJob(data.jobId, "video");
-    } catch {
-      const tmpId = `err-${Date.now()}`;
-      const card = createJobCard(tmpId, "video");
-      card.status = "error";
-      card.errorMsg = "Server belum jalan. Buka aplikasi lewat start.bat ya.";
-      setJobs((prev) => new Map(prev).set(tmpId, card));
-      setJobOrder((prev) => [tmpId, ...prev]);
-    } finally {
-      setSubmitting(null);
-    }
+    await startVideoJob({
+      url: videoUrl.trim(),
+      resolution,
+      format: videoFormat,
+      outputDir: videoOutputDir.trim(),
+    });
+  }
+
+  /**
+   * Coba lagi dari kartu yang gagal. Request yang sama dikirim ulang: file yang
+   * sudah turun + ".part" dilanjutkan (resume), bukan diunduh dari nol.
+   */
+  async function retryVideoJob(jobId: string) {
+    const job = jobs.get(jobId);
+    if (!job?.request || submitting) return;
+    dismissJob(jobId);
+    await startVideoJob(job.request);
   }
 
   async function cancelJob(jobId: string) {
@@ -921,6 +961,8 @@ export default function Home() {
       warnings: [],
       errorMsg: item.error ?? "",
       cancelling: false,
+      retryInfo: null,
+      request: null,
     };
     setJobs((prev) => {
       if (prev.has(item.id)) return prev;
@@ -1009,7 +1051,15 @@ export default function Home() {
                     <IconStop /> {job.cancelling ? "Membatalkan..." : "Batalkan"}
                   </button>
                 ) : (
-                  <button type="button" className="icon-btn" onClick={() => dismissJob(job.id)} aria-label="Tutup"><IconX /></button>
+                  <>
+                    {/* Video yang gagal bisa dilanjutkan: request sama, yang sudah ada diskip + .part dilanjutkan. */}
+                    {job.request && (summaryAny?.failed ?? 0) > 0 && (
+                      <button type="button" className="btn tint btn-sm" onClick={() => retryVideoJob(job.id)} disabled={submitting !== null}>
+                        <IconDownload /> Coba lagi yang gagal ({summaryAny.failed})
+                      </button>
+                    )}
+                    <button type="button" className="icon-btn" onClick={() => dismissJob(job.id)} aria-label="Tutup"><IconX /></button>
+                  </>
                 )}
               </div>
             </div>
@@ -1023,6 +1073,17 @@ export default function Home() {
                   {job.warnings.length > 0 && <span className="warn-text">{job.warnings[0]}</span>}
                 </div>
               </>
+            )}
+            {job.retryInfo && isRunning && (
+              <div className="warn-box">
+                <IconWarn />{" "}
+                <span>
+                  {job.retryInfo.index !== undefined
+                    ? `Video "${job.rows[job.retryInfo.index]?.title ?? `#${job.retryInfo.index + 1}`}" gagal sementara (${lastErrorLine(job.retryInfo.error)})`
+                    : `Gagal sementara (${lastErrorLine(job.retryInfo.error)})`}
+                  {" — "}menyambung ulang, percobaan {job.retryInfo.attempt}/{job.retryInfo.maxAttempts}
+                </span>
+              </div>
             )}
           </div>
 
@@ -1192,6 +1253,14 @@ export default function Home() {
               </div>
             </div>
           )}
+          {job.retryInfo && isRunning && (
+            <div className="warn-box">
+              <IconWarn />{" "}
+              <span>
+                Gagal sementara ({lastErrorLine(job.retryInfo.error)}) — menyambung ulang, percobaan {job.retryInfo.attempt}/{job.retryInfo.maxAttempts}
+              </span>
+            </div>
+          )}
           {job.videoResult && (
             <div className="queue">
               <div className="queue-head">
@@ -1207,6 +1276,18 @@ export default function Home() {
             </div>
           )}
           {job.errorMsg && <div className="error-box"><IconX /> <span>{job.errorMsg}</span></div>}
+          {job.status === "error" && job.request && (
+            <div className="dest-row">
+              <span className="dest-icon"><IconDownload /></span>
+              <div className="dest-info">
+                <div className="dest-label">Unduhan berhenti</div>
+                <div className="dest-path">Bagian yang sudah turun tetap disimpan — "Coba lagi" melanjutkan dari titik terakhir, bukan dari nol.</div>
+              </div>
+              <button type="button" className="btn tint" onClick={() => retryVideoJob(job.id)} disabled={submitting !== null}>
+                Coba lagi
+              </button>
+            </div>
+          )}
           {job.warnings.map((w, i) => (
             <div key={i} className="warn-box"><IconWarn /> <span>{w}</span></div>
           ))}

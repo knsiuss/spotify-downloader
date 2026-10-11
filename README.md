@@ -83,6 +83,22 @@ Tanpa cookies/akun, menembak YouTube terlalu cepat akan memicu `429` / “Sign i
 
 ---
 
+## 🔁 Resume & retry download video
+
+Kegagalan (timeout, `HTTP Error 403/429`, koneksi putus) tidak lagi langsung menggagalkan unduhan:
+
+1. **Retry otomatis** — sampai 3 percobaan per file dengan backoff eksponensial + jitter. Error fatal (video privat/dihapus) tidak diulang.
+2. **Resume sungguhan** — tiap percobaan memakai perintah yt-dlp yang identik dengan `--continue`, jadi byte/fragment yang sudah turun (`.part`/`.ytdl`) **dilanjutkan**, bukan diulang dari 0%.
+3. **Bukan gagal palsu** — kalau file final sudah lengkap ditulis sebelum proses yt-dlp tewas, unduhan dihitung sukses (dibuktikan: file utuh tapi job tadinya lapor error).
+4. **Tanpa proses yatim** — yt-dlp yang dibatalkan/di-timeout dibunuh beserta turunannya (ffmpeg penyebab file terus ditulis setelah job "gagal").
+5. **Tombol "Coba lagi"** di kartu yang gagal (single video + playlist yang punya video gagal) — mengirim request yang sama, otomatis melanjutkan dari titik berhenti. Video yang sudah ada di-skip, jadi playlist bisa diulang tanpa mengunduh ulang yang sudah selesai.
+
+Selama percobaan ulang berjalan, kartu menampilkan peringatan “menyambung ulang, percobaan 2/3” supaya tidak terlihat macet.
+
+**Knob (opsional):** `DROP_VIDEO_RETRIES` (jumlah percobaan per file, default 3) dan `DROP_VIDEO_TIMEOUT_MS` (timeout **per percobaan**, default 600000).
+
+---
+
 ## ⚙️ Konfigurasi (`.env`, opsional)
 
 ```
@@ -97,6 +113,10 @@ YT_COOKIES=./cookies.txt
 
 # Jeda minimum antar spawn yt-dlp (ms)
 DROP_YT_MIN_GAP_MS=1400
+
+# Percobaan ulang download video (per file) + timeout per percobaan (ms)
+DROP_VIDEO_RETRIES=3
+DROP_VIDEO_TIMEOUT_MS=600000
 ```
 
 ---

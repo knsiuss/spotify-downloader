@@ -3,12 +3,19 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { runYtDlp, parseYtDlpProgress } from "../providers/youtube.js";
+import { runYtDlp, parseYtDlpProgress, isRetryableYtDlpError } from "../providers/youtube.js";
 import { sanitizeFilename } from "../audio/ffmpeg.js";
 import type { FileProgress } from "../core/types.js";
 
 export type VideoResolution = "144" | "240" | "360" | "480" | "720" | "1080" | "1440" | "2160" | "best";
 export type VideoFormat = "mp4" | "webm" | "mkv";
+
+/** Info percobaan ulang — dikirim ke UI supaya kartu tidak terlihat mati saat yt-dlp gagal sekali. */
+export interface RetryInfo {
+  attempt: number;
+  maxAttempts: number;
+  error: string;
+}
 
 export interface VideoInfo {
   id: string;
@@ -74,6 +81,128 @@ export function buildVideoSort(resolution: VideoResolution, format: VideoFormat)
   }
   const h = parseInt(resolution, 10);
   return format === "webm" ? `res:${h},vcodec,br` : `res:${h},br`;
+}
+
+/** Jumlah percobaan per file (1 = perilaku lama tanpa retry). */
+const MAX_ATTEMPTS = Math.max(1, Number(process.env.DROP_VIDEO_RETRIES ?? 3));
+
+/** Timeout per percobaan, bukan total: percobaan berikutnya resume dari .part,
+ * jadi anggaran waktu penuh per percobaan tidak berarti mengulang dari 0%. */
+const ATTEMPT_TIMEOUT_MS = Number(process.env.DROP_VIDEO_TIMEOUT_MS ?? 600_000);
+const RETRY_BASE_DELAY_MS = 2_000;
+const RETRY_MAX_DELAY_MS = 15_000;
+
+/** Sleep yang tetap responsif terhadap cancel. */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) { resolve(); return; }
+    const onAbort = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function retryDelayMs(attempt: number): number {
+  const backoff = Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
+  // Jitter supaya beberapa video yang gagal barengan tidak retry serempak.
+  return backoff + Math.random() * 1_000;
+}
+
+/** Bentuk eksekutor yt-dlp — disuntikkan di test supaya tidak perlu binary asli. */
+export type YtDlpRunner = (
+  args: string[],
+  options: { timeoutMs: number; signal?: AbortSignal; onLine?: (line: string) => void },
+) => Promise<string>;
+
+/**
+ * yt-dlp dengan resume: kegagalan transient (timeout, HTTP 403/429/5xx,
+ * koneksi putus) diulang dengan backoff. yt-dlp default `--continue` + tulis
+ * ke `.part`, jadi percobaan berikutnya melanjutkan byte yang sudah turun
+ * (contoh: berhenti di 43% → lanjut 44%, bukan mulai dari nol).
+ */
+export async function runYtDlpWithResume(
+  args: string[],
+  opts: {
+    signal?: AbortSignal;
+    onLine?: (line: string) => void;
+    onRetry?: (info: RetryInfo) => void;
+    run?: YtDlpRunner;
+    /** Override jeda antar percobaan (dipakai test supaya cepat). */
+    retryDelayMs?: number;
+    /** Probe "file final sudah ada" — yt-dlp bisa selesai menulis lalu gagal exit. */
+    isComplete?: () => boolean;
+  } = {},
+): Promise<void> {
+  const run = opts.run ?? runYtDlp;
+  for (let attempt = 1; ; attempt++) {
+    if (opts.signal?.aborted) throw new Error("cancelled");
+    try {
+      await run(args, {
+        timeoutMs: ATTEMPT_TIMEOUT_MS,
+        signal: opts.signal,
+        onLine: opts.onLine,
+      });
+      return;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg === "cancelled" || opts.signal?.aborted) throw new Error("cancelled");
+      // File kelar ditulis tapi proses tewas (hang di exit / post-processing
+      // gagal) — itu sukses, jangan buang waktu retry.
+      if (opts.isComplete?.()) return;
+      const canRetry = attempt < MAX_ATTEMPTS && isRetryableYtDlpError(msg);
+      if (!canRetry) throw err instanceof Error ? err : new Error(msg);
+      opts.onRetry?.({ attempt: attempt + 1, maxAttempts: MAX_ATTEMPTS, error: msg });
+      await sleepAbortable(opts.retryDelayMs ?? retryDelayMs(attempt), opts.signal);
+    }
+  }
+}
+
+/** Args yt-dlp untuk satu file video — dipakai single & playlist biar perilaku identik. */
+export function buildVideoArgs(
+  videoUrl: string,
+  outTemplate: string,
+  resolution: VideoResolution,
+  format: VideoFormat,
+  cookiesFile?: string,
+): string[] {
+  const args = [
+    videoUrl,
+    "-f", buildVideoFormat(resolution, format),
+    "-S", buildVideoSort(resolution, format),
+    "--merge-output-format", format,
+    "--no-playlist",
+    // Eksplisit walau ini default yt-dlp: percobaan ulang HARUS melanjutkan .part.
+    "--continue",
+    "-o", outTemplate,
+    "--no-warnings",
+    "--js-runtimes", "node",
+  ];
+  if (cookiesFile) args.push("--cookies", cookiesFile);
+  return args;
+}
+
+/**
+ * Cari file final hasil unduhan. Mengabaikan `.part`/`.ytdl` (sisa unduhan
+ * terputus) dan intermediate stream merge (`.f137.mp4`) supaya unduhan yang
+ * gagal di tengah tidak salah dilaporkan sukses. Kalau ada beberapa ekstensi
+ * (mis. sisa unduhan format lain), utamakan `preferredExt`.
+ */
+export function findDownloadedFile(dir: string, fileBase: string, preferredExt?: string): string | null {
+  const files = fs.readdirSync(dir)
+    .filter((name) => name.startsWith(fileBase))
+    .filter((name) => !name.includes(".part") && !name.includes(".ytdl"))
+    .filter((name) => !/\.f\d+\./.test(name))
+    .filter((name) => fs.statSync(path.join(dir, name)).size > 0);
+  if (files.length === 0) return null;
+  const preferred = preferredExt ? files.filter((name) => name.endsWith(`.${preferredExt}`)) : [];
+  const pool = preferred.length > 0 ? preferred : files;
+  const newest = pool
+    .map((name) => ({ name, mtimeMs: fs.statSync(path.join(dir, name)).mtimeMs }))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+  return path.join(dir, newest.name);
 }
 
 export interface YouTubePlaylistInfo {
@@ -150,7 +279,12 @@ export async function getYouTubePlaylistInfo(url: string): Promise<YouTubePlayli
 /** Download video YouTube dengan resolution custom. */
 export async function downloadVideo(
   req: VideoDownloadRequest,
-  opts: { signal?: AbortSignal; onProgress?: (p: FileProgress) => void } = {},
+  opts: {
+    signal?: AbortSignal;
+    onProgress?: (p: FileProgress) => void;
+    /** Dipanggil tiap kali percobaan diulang (misal timeout/403) — UI tampilkan "menyambung ulang". */
+    onRetry?: (info: RetryInfo) => void;
+  } = {},
 ): Promise<VideoDownloadResult> {
   const id = parseYouTubeUrl(req.url);
   if (!id) {
@@ -168,8 +302,6 @@ export async function downloadVideo(
   }
 
   const baseName = sanitizeFilename(info.title);
-  const formatSel = buildVideoFormat(req.resolution, req.format);
-  const sortSel = buildVideoSort(req.resolution, req.format);
 
   // File name include resolution biar 360p vs 1080p gak dianggap sama
   const fileBase = `${baseName} [${req.resolution}p]`;
@@ -179,26 +311,17 @@ export async function downloadVideo(
   }
 
   const outTemplate = path.join(req.outputDir, `${fileBase}.%(ext)s`);
-  const args = [
-    req.url,
-    "-f", formatSel,
-    "-S", sortSel,
-    "--merge-output-format", req.format,
-    "--no-playlist",
-    "-o", outTemplate,
-    "--no-warnings",
-    "--js-runtimes", "node",
-  ];
-  if (req.cookiesFile) args.push("--cookies", req.cookiesFile);
+  const args = buildVideoArgs(req.url, outTemplate, req.resolution, req.format, req.cookiesFile);
 
   try {
-    await runYtDlp(args, {
-      timeoutMs: 600_000,
+    await runYtDlpWithResume(args, {
       signal: opts.signal,
       onLine: (line) => {
         const p = parseYtDlpProgress(line);
         if (p) opts.onProgress?.(p);
       },
+      onRetry: opts.onRetry,
+      isComplete: () => findDownloadedFile(req.outputDir, fileBase, req.format) !== null,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -209,14 +332,11 @@ export async function downloadVideo(
   }
 
   // Cari file hasil — pakai fileBase
-  const files = fs.readdirSync(req.outputDir).filter((f) => f.startsWith(fileBase));
-  if (files.length === 0) {
+  const downloaded = findDownloadedFile(req.outputDir, fileBase, req.format);
+  if (!downloaded) {
     return { ok: false, outputPath: null, info, error: "yt-dlp selesai tapi file tidak ditemukan" };
   }
-  const sorted = files
-    .map((f) => ({ name: f, stat: fs.statSync(path.join(req.outputDir, f)) }))
-    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
-  return { ok: true, outputPath: path.join(req.outputDir, sorted[0].name), info, error: null };
+  return { ok: true, outputPath: downloaded, info, error: null };
 }
 
 export interface YouTubePlaylistDownloadRequest extends VideoDownloadRequest {}
@@ -238,14 +358,13 @@ export async function downloadYouTubePlaylist(
     signal?: AbortSignal;
     onStage?: (stage: "searching" | "downloading", index: number) => void;
     onFileProgress?: (p: FileProgress, index: number) => void;
+    onRetry?: (info: RetryInfo, index: number) => void;
     onTrack?: (result: { ok: boolean; error: string | null; outputPath: string | null; title: string }, index: number) => void;
     onProgress?: (completed: number, total: number) => void;
   } = {},
 ): Promise<YouTubePlaylistDownloadResult> {
   const playlistDir = path.join(req.outputDir, sanitizeFilename(playlist.title));
   fs.mkdirSync(playlistDir, { recursive: true });
-  const formatSel = buildVideoFormat(req.resolution, req.format);
-  const sortSel = buildVideoSort(req.resolution, req.format);
   let succeeded = 0, failed = 0, skipped = 0;
 
   for (let i = 0; i < playlist.videos.length; i++) {
@@ -268,34 +387,24 @@ export async function downloadYouTubePlaylist(
     }
     const outTemplate = path.join(playlistDir, `${fileBase}.%(ext)s`);
     const videoUrl = `https://www.youtube.com/watch?v=${v.id}`;
-    const args = [
-      videoUrl,
-      "-f", formatSel,
-      "-S", sortSel,
-      "--merge-output-format", req.format,
-      "--no-playlist",
-      "-o", outTemplate,
-      "--no-warnings",
-      "--js-runtimes", "node",
-    ];
-    if (req.cookiesFile) args.push("--cookies", req.cookiesFile);
+    const args = buildVideoArgs(videoUrl, outTemplate, req.resolution, req.format, req.cookiesFile);
     try {
-      await runYtDlp(args, {
-        timeoutMs: 600_000,
+      await runYtDlpWithResume(args, {
         signal: opts.signal,
         onLine: (line) => {
           const p = parseYtDlpProgress(line);
           if (p) opts.onFileProgress?.(p, i);
         },
+        onRetry: (info) => opts.onRetry?.(info, i),
+        isComplete: () => findDownloadedFile(playlistDir, fileBase, req.format) !== null,
       });
-      const files = fs.readdirSync(playlistDir).filter((f) => f.startsWith(fileBase));
-      if (files.length === 0) {
+      const downloaded = findDownloadedFile(playlistDir, fileBase, req.format);
+      if (!downloaded) {
         failed++;
         opts.onTrack?.({ ok: false, error: "file tidak ditemukan", outputPath: null, title: v.title }, i);
       } else {
-        const sorted = files.map((f) => ({ name: f, stat: fs.statSync(path.join(playlistDir, f)) })).sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
         succeeded++;
-        opts.onTrack?.({ ok: true, error: null, outputPath: path.join(playlistDir, sorted[0].name), title: v.title }, i);
+        opts.onTrack?.({ ok: true, error: null, outputPath: downloaded, title: v.title }, i);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

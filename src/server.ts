@@ -221,6 +221,7 @@ async function runVideoJob(
             (job as any).progress = { completed: completedCount, total: pl.videos.length, speedBps: sumSpeeds() };
             emit({ type: "track_progress", index, percent: p.percent, speedBps: p.speedBps, etaSec: p.etaSec, downloadedBytes: p.downloadedBytes, totalBytes: p.totalBytes });
           },
+          onRetry: (info, index) => emit({ type: "track_retry", index, ...info }),
           onTrack: (r, index) => {
             const ok = r.ok;
             const skipped = r.error === "sudah ada";
@@ -253,6 +254,7 @@ async function runVideoJob(
 
   const result = await downloadVideo(params, {
     signal: job.signal,
+    onRetry: (info) => emit({ type: "video_retry", ...info }),
     onProgress: (p) =>
       emit({
         type: "video_progress",
