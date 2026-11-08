@@ -65,6 +65,7 @@ function maybeUpdateYtDlp(base) {
       if (!require("node:fs").existsSync(ytdlpExe)) return; // PATH fallback (dev): jangan update sistem user
       console.log("[desktop] yt-dlp berumur", d.ytDlp.ageDays, "hari — mencoba self-update...");
       const up = spawn(ytdlpExe, ["-U"], { windowsHide: true, stdio: "ignore" });
+      up.on("error", (err) => console.error("[desktop] yt-dlp self-update gagal spawn:", err.message));
       up.on("close", (code) => console.log("[desktop] yt-dlp -U exit:", code));
     } catch { /* offline / dsb — abaikan */ }
   })();
@@ -171,8 +172,10 @@ if (!gotLock) {
     if (serverProc && serverProc.pid) {
       if (process.platform === "win32") {
         try {
-          spawn("taskkill", ["/pid", String(serverProc.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-        } catch {
+          const tk = spawn("taskkill", ["/pid", String(serverProc.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+          tk.on("error", (err) => console.error("[desktop] taskkill gagal spawn:", err.message));
+        } catch (err) {
+          console.error("[desktop] taskkill gagal:", err);
           serverProc.kill("SIGTERM");
         }
       } else {

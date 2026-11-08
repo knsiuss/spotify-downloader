@@ -7,7 +7,7 @@ const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
 // ---------------- Types ----------------
 
 type Tab = "music" | "video";
-type RowState = "queued" | "searching" | "downloading" | "transcoding" | "done" | "failed" | "skipped";
+type RowState = "queued" | "searching" | "downloading" | "transcoding" | "lyrics" | "done" | "failed" | "skipped";
 
 interface QueueRow {
   index: number;
@@ -133,6 +133,7 @@ function StatusGlyph({ state }: { state: RowState }) {
     case "searching": return <IconSearch spin />;
     case "downloading": return <span className="eq"><span /><span /><span /></span>;
     case "transcoding": return <IconBars />;
+    case "lyrics": return <IconBars />;
     case "done": return <IconCheck />;
     case "failed": return <IconX />;
     case "skipped": return <IconSkip />;
@@ -576,9 +577,8 @@ export default function Home() {
   }
 
   function applyEvent(jobId: string, msg: Record<string, any>) {
-    const job = jobs.get(jobId);
-    // fallback: cari dari map terbaru via setJobs updater - but we use direct state snapshot, need to handle async
-    // So we use functional setJobs for each case instead of reading jobs stale
+    // Updater fungsional setJobs dipakai di semua case - state snapshot lokal
+    // akan stale, jadi jangan baca jobs langsung di sini.
     switch (msg.type) {
       case "start": {
         // video single: {info}
@@ -758,6 +758,10 @@ export default function Home() {
     terminalsRef.current.set(jobId, false);
     try {
       const res = await fetch(`${BACKEND_URL}/api/jobs/${jobId}/events`, { signal: ctrl.signal });
+      // 404 = job tidak ada di memori server (riwayat lama / server restart).
+      // Bukan error: kartu tetap tampil statis dari data history. Tandai terminal
+      // supaya blok reconnect di bawah tidak mengubah status "done" jadi "error".
+      if (res.status === 404) { terminalsRef.current.set(jobId, true); return; }
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
       const reader = res.body.getReader();
       const decoder = new TextDecoder();

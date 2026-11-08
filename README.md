@@ -74,10 +74,10 @@ npm test
 Tanpa cookies/akun, menembak YouTube terlalu cepat akan memicu `429` / “Sign in to confirm you're not a bot”. Mitigasinya (terpasang otomatis):
 
 1. **Pacing gate global** — jeda minimum + jitter antar peluncuran proses yt-dlp, lintas semua worker paralel, supaya tidak menembak bersamaan.
-2. **Flag yt-dlp cerdas** (disuntikkan terpusat di `src/providers/youtube.ts`): `--sleep-requests` (jeda antar request), `--retries` + `--retry-sleep http:exp=1:20` (backoff eksponensial khusus HTTP 429/503).
-3. **Cooldown + backoff khusus rate-limit** di level batch (`src/lib/index.ts`) — saat satu lagu kena limit, worker lain ikut mengendur, bukan retry barengan (stampede).
+2. **Flag yt-dlp cerdas** (disuntikkan terpusat di `src/providers/youtube.ts`): `--force-ipv4`, `--sleep-requests 1.0` (jeda antar request), `--retries` + `--retry-sleep http:exp=1:20` (backoff eksponensial khusus HTTP 429/503).
+3. **Cooldown + backoff khusus rate-limit** di level batch (`src/lib/index.ts`) — saat satu lagu kena limit, worker lain ikut mengendur, bukan retry barengan (stampede). Cooldown dasar 30s, maksimum 120s. Error "not a bot" dan 429 diperlakukan sebagai rate-limit juga.
 
-**Knob (opsional):** `DROP_YT_MIN_GAP_MS` (ms) untuk mengatur jeda pacing (default 1400). Lebih besar = lebih aman tapi lebih lambat.
+**Knob (opsional):** `DROP_YT_MIN_GAP_MS` (ms) untuk mengatur jeda pacing (default 2000). Lebih besar = lebih aman tapi lebih lambat.
 
 > Kalau punya **cookies YouTube** (`.txt`) atau **akun Qobuz**, stabilitas naik drastis (lihat Konfigurasi).
 
@@ -112,7 +112,7 @@ QOBUZ_PASSWORD=...
 YT_COOKIES=./cookies.txt
 
 # Jeda minimum antar spawn yt-dlp (ms)
-DROP_YT_MIN_GAP_MS=1400
+DROP_YT_MIN_GAP_MS=2000
 
 # Percobaan ulang download video (per file) + timeout per percobaan (ms)
 DROP_VIDEO_RETRIES=3
@@ -162,6 +162,23 @@ Stack: **TypeScript / Node ≥ 22** untuk backend & pipeline, **Next.js (static 
 ## 🐞 ⚠️ Catatan packaging (penting!)
 
 `dist/server.js` adalah **ES module**. Saat ter-paket dan dijalankan **di luar folder project** (mis. `C:\Users\<kamu>\Programs\DROP\`), Node mencari `package.json` bernilai `"type":"module"` di direktori di atasnya. Karena itu, `scripts/write-server-pkg.mjs` **wajib** menulis `dist/package.json` saat build (langkah ini ada di `npm run build`). Kalau hilang/dihilangkan, server internal gagal start dengan `SyntaxError: Cannot use import statement outside a module`.
+
+---
+
+## 📦 Kenapa build ini (v0.3.1)
+
+Perbaikan audit + anti rate-limit lanjutan:
+
+- **Fix cover art** - MP3/FLAC tidak di-encode ulang saat menyisipkan cover (`-c:a copy`), dan file temp cover pakai nama unik (tidak saling menimpa antar worker paralel).
+- **Fix API input** - `concurrency`/`retries`/`limit` dari body API dipaksa finite + di-clamp; `"abc"` dulu bikin batch berakhir "done" dengan nol file.
+- **Fix retry sia-sia** - gagal verifikasi WAV/ffprobe kini dikategorikan `format` (tidak diulang); error fatal yt-dlp ("video unavailable"/"private video") tidak di-retry walau per kategori `provider`.
+- **Fix tahap lirik di UI** - status "lirik" punya ikon + style sendiri (sebelumnya tampil seperti queued).
+- **Fix riwayat persisten** - membuka job dari `history.json` yang tidak ada di memori server tidak lagi mengubah kartu "done" jadi error HTTP 404.
+- **Fix Qobuz** - `getFileUrl` kini ditandatangani (`request_ts` + `request_sig` = MD5 sesuai algoritma web player), login memakai GET + password MD5 (sebelumnya POST plaintext yang bukan format API), token dikirim sebagai header `X-User-Auth-Token`, `app_id` juga disertakan sebagai query param, dan format dicoba berjenjang 27→7→6→5 sesuai tier akun. Provider Qobuz juga kini aktif di mode server (dulu `req.env` kosong sehingga diam-diam tidak terpakai walau diagnostics melaporkan terkonfigurasi).
+- **Fix cancel** - membatalkan job saat mengambil metadata Spotify benar-benar berhenti (sebelumnya fetch tanpa signal bisa menggantung forever); semua fetch eksternal sekarang punya timeout keras (Spotify embed/oEmbed 20s, cover 10s, Qobuz 15-300s).
+- **Fix report order** - `report.json` berurutan sesuai playlist (sebelumnya urutan selesai, acak).
+- **Anti rate-limit v2** - default spawn gap 2000ms (dari 1400), `--force-ipv4`, `--sleep-requests 1.0`, cooldown batch 30s/maksimum 120s, "not a bot" dianggap rate-limit. Kalau masih kena, naikkan `DROP_YT_MIN_GAP_MS` atau pakai cookies.
+- **Hardening** - `spawn` eksternal selalu punya error handler (taskkill/explorer/yt-dlp -U) supaya kegagalan spawn tidak jadi uncaught exception; nama folder playlist video di UI = lokasi file sungguhan.
 
 ---
 

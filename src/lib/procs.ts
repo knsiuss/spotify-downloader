@@ -28,10 +28,13 @@ export function trackedCount(): number {
 export function killProcessTree(child: ChildProcess): void {
   try {
     if (process.platform === "win32" && child.pid) {
-      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
         windowsHide: true,
         stdio: "ignore",
-      }).unref();
+      });
+      // Tanpa listener, 'error' event dari taskkill jadi uncaught exception.
+      killer.on("error", () => {});
+      killer.unref();
       return;
     }
     child.kill("SIGKILL");

@@ -6,7 +6,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { fetchSpotifyMetadata } from "../metadata/spotify.js";
 import type { SpotifySource } from "../metadata/spotify.js";
-import { YouTubeProvider } from "../providers/youtube.js";
+import { YouTubeProvider, isRetryableYtDlpError } from "../providers/youtube.js";
 import { SoundCloudProvider } from "../providers/soundcloud.js";
 import { QobuzProvider, loadQobuzConfig } from "../providers/qobuz.js";
 import { processTrack } from "../core/pipeline.js";
@@ -15,6 +15,7 @@ import { sanitizeFilename } from "../audio/ffmpeg.js";
 import { writeReport } from "./report.js";
 import type { DownloadResult, OutputFormat, Provider, Track, FileProgress, ErrorCategory } from "../core/types.js";
 import { AppError } from "../core/types.js";
+import { clampNumber } from "./validate.js";
 
 export interface DownloadRequest {
   /** Link Spotify (URL atau URI). */
@@ -68,7 +69,10 @@ export interface DownloadCallbacks {
 
 /** Bangun daftar provider dari request. */
 function buildProviders(req: DownloadRequest): Provider[] {
-  const env = req.env ?? {};
+  // req.env hanya diisi CLI (dari .env). Mode server tidak mengisi env,
+  // jadi fallback ke process.env — tanpa ini provider Qobuz mati diam-diam di
+  // server walau /api/diagnostics melaporkan qobuzConfigured: true.
+  const env = req.env ?? process.env;
   const cookiesFile = req.cookiesFile ?? env.YT_COOKIES;
   const providers: Provider[] = [
     new YouTubeProvider(cookiesFile ? { cookiesFile: path.resolve(cookiesFile) } : {}),
@@ -81,11 +85,15 @@ function buildProviders(req: DownloadRequest): Provider[] {
   return providers;
 }
 
-/** Cek apakah error layak di-retry (network errors, provider errors — bukan no-match/format). */
-function isRetryable(result: DownloadResult): boolean {
+/** Cek apakah error layak di-retry (network errors, provider errors - bukan no-match/format).
+ *  Diekspor untuk test. */
+export function isRetryable(result: DownloadResult): boolean {
   if (result.ok) return false;
   if (result.error?.includes("sudah ada")) return false;
   if (result.errorCategory === "cancelled") return false;
+  // Error fatal bawaan yt-dlp (video hilang/privat/members-only) tidak layak diulang,
+  // walau diklasifikasikan sebagai "provider" - mengulangnya percuma.
+  if (result.error && !isRetryableYtDlpError(result.error)) return false;
   // Retry hanya untuk error transient (network, rate-limit), bukan "no match" atau "format"
   return result.errorCategory === "network" || result.errorCategory === "rate-limit" || result.errorCategory === "provider";
 }
@@ -93,8 +101,8 @@ function isRetryable(result: DownloadResult): boolean {
 // Cooldown global saat batch kena rate-limit: worker lain ikut mengendur
 // supaya tidak stampede (semua retry barengan justru makin memicu 429).
 let rateLimitCooldownUntil = 0;
-const RATE_LIMIT_BASE_BACKOFF_MS = 15_000;
-const RATE_LIMIT_MAX_BACKOFF_MS = 60_000;
+const RATE_LIMIT_BASE_BACKOFF_MS = 30_000;
+const RATE_LIMIT_MAX_BACKOFF_MS = 120_000;
 
 /** Sleep yang bisa diputus oleh signal (dibatalkan = resolve lebih awal). */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -178,18 +186,23 @@ export async function downloadTracks(
   const started = Date.now();
   const signal = callbacks?.signal;
   const providers = buildProviders(req);
-  const retries = req.retries ?? 1;
+  // NaN dari body API (mis. concurrency: "abc") dulu di-clamp ke default -
+  // Array.from({length: NaN}) = 0 worker = batch "selesai" dengan nol file.
+  const retries = req.retries === undefined ? 1 : clampNumber(req.retries, 1, 0, 5);
+  const limit = req.limit !== undefined && Number.isFinite(req.limit) && req.limit > 0
+    ? Math.floor(req.limit)
+    : undefined;
 
   // Playlist/album → subfolder sendiri di dalam output dir.
   const target = resolveTargetDir(req, source);
   ensureTargetDir(target.dir);
 
-  const tracks: Track[] = req.limit
-    ? source.tracks.slice(0, Math.max(1, req.limit))
+  const tracks: Track[] = limit
+    ? source.tracks.slice(0, limit)
     : source.tracks;
 
   // Warn kalau playlist terpotong.
-  if (source.truncated && !req.limit) {
+  if (source.truncated && !limit) {
     callbacks?.onWarning?.(
       `Playlist "${source.name}" mungkin terpotong (embed endpoint render maks ~100 track). ` +
       `Gunakan limit, atau bagi playlist besar.`,
@@ -197,9 +210,12 @@ export async function downloadTracks(
   }
 
   // Proses dengan konkurensi terbatas.
-  const results: DownloadResult[] = [];
-  const concurrency = Math.max(1, req.concurrency ?? 3);
+  // Slot diisi per-index (bukan push) supaya report/hasil berurutan sesuai playlist,
+  // walau track selesai tidak berurutan.
+  const results: Array<DownloadResult | undefined> = new Array(tracks.length);
+  const concurrency = req.concurrency === undefined ? 3 : clampNumber(req.concurrency, 3, 1, 8);
   let idx = 0;
+  let completedCount = 0;
 
   async function worker() {
     while (idx < tracks.length && !signal?.aborted) {
@@ -223,9 +239,10 @@ export async function downloadTracks(
         },
         retries,
       );
-      results.push(result);
+      results[i] = result;
+      completedCount++;
       callbacks?.onTrack?.(result, i);
-      callbacks?.onProgress?.(results.length, tracks.length);
+      callbacks?.onProgress?.(completedCount, tracks.length);
     }
   }
 
@@ -233,19 +250,21 @@ export async function downloadTracks(
   await Promise.all(workers);
 
   const cancelled = Boolean(signal?.aborted);
-  const succeeded = results.filter((r) => r.ok && r.error === null).length;
-  const skipped = results.filter((r) => r.ok && r.error === "sudah ada").length;
-  const failed = results.length - succeeded - skipped;
+  // Lubang (track yang belum sempat diproses karena cancel) dibuang; urutan tetap index.
+  const processed = results.filter((r): r is DownloadResult => r !== undefined);
+  const succeeded = processed.filter((r) => r.ok && r.error === null).length;
+  const skipped = processed.filter((r) => r.ok && r.error === "sudah ada").length;
+  const failed = processed.length - succeeded - skipped;
 
   // Tulis report hanya kalau batch selesai normal (bukan dibatalkan).
   let reportPath: string | null = null;
   if (!cancelled) {
     reportPath = path.join(target.dir, "report.json");
-    writeReport(reportPath, { source, results, req, durationMs: Date.now() - started });
+    writeReport(reportPath, { source, results: processed, req, durationMs: Date.now() - started });
   }
 
   return {
-    results,
+    results: processed,
     summary: {
       total: tracks.length,
       succeeded,

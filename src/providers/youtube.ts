@@ -23,7 +23,8 @@ export interface RunYtDlpOptions {
 // Tujuan: kurangi burst request ke YouTube yang memicu 429 / "Sign in to
 // confirm you're not a bot", tanpa perlu cookies/akun.
 const YT_PACING_FLAGS = [
-  "--sleep-requests", "0.6", // jeda antar request HTTP saat ekstraksi metadata
+  "--force-ipv4", // rentang IPv6 sering ke-throttle/diblokir duluan oleh YouTube
+  "--sleep-requests", "1.0", // jeda antar request HTTP saat ekstraksi metadata
   "--retries", "6", // yt-dlp retry sendiri error transient
   "--retry-sleep", "http:exp=1:20", // backoff eksponensial khusus HTTP (429/503)
   "--extractor-retries", "3",
@@ -32,7 +33,9 @@ const YT_PACING_FLAGS = [
 // Gate jeda minimum antar spawn proses yt-dlp, lintas semua worker paralel &
 // provider. Tanpa ini, worker paralel bisa menembak YouTube bersamaan
 // (stampede) — penyebab utama kena rate limit.
-const MIN_SPAWN_GAP_MS = Math.max(0, Number(process.env.DROP_YT_MIN_GAP_MS ?? 1400));
+// Default lebih longgar dari 1400: batch 3-worker dengan gap ketat tetap kena
+// 429 dari YouTube. Naikkan lagi lewat env kalau IP-nya sudah keburu dibatasi.
+const MIN_SPAWN_GAP_MS = Math.max(0, Number(process.env.DROP_YT_MIN_GAP_MS ?? 2000));
 let spawnChain: Promise<void> = Promise.resolve();
 let lastSpawnAt = 0;
 

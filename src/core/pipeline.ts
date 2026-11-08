@@ -42,9 +42,10 @@ function sortProviders(providers: Provider[]): Provider[] {
   return [...providers].sort((a, b) => a.priority - b.priority);
 }
 
-/** Tebak kategori error dari pesan yt-dlp/fetch supaya retry policy lebih tepat. */
-function classifyError(message: string): ErrorCategory {
-  if (/429|rate.?limit|too many requests|blocked/i.test(message)) return "rate-limit";
+/** Tebak kategori error dari pesan yt-dlp/fetch supaya retry policy lebih tepat.
+ *  Diekspor untuk test. */
+export function classifyError(message: string): ErrorCategory {
+  if (/429|rate.?limit|too many requests|blocked|not a bot/i.test(message)) return "rate-limit";
   if (/timed? ?out|ETIMEDOUT|ENOTFOUND|ECONNRESET|ECONNREFUSED|getaddrinfo|network|unable to download webpage/i.test(message)) return "network";
   return "provider";
 }
@@ -176,9 +177,14 @@ export async function processTrack(track: Track, opts: PipelineOptions): Promise
     };
 
     let ladderResult = await runLadder(false);
-    // Pass relaxed (judul saja) kalau pass pertama gagal total — search YouTube
-    // flaky, dan error provider lain (DRM/404) tidak boleh memblokir percobaan ini.
-    if (!ladderResult.src && !opts.signal?.aborted && ladderResult.errs.length > 0) {
+    // Pass relaxed (judul saja) hanya kalau pass pertama gagal karena TIDAK ADA MATCH
+    // di semua provider. Error transient (network/rate-limit/403) tidak layak
+    // memicu ladder kedua - itu cuma menggandakan request ke sumber yang sama.
+    const hasNoMatch = ladderResult.errs.some((e) => e.includes("tidak ada"));
+    const hasTransient = ladderResult.errs.some((e) =>
+      /rate.?limit|429|timed? ?out|ETIMEDOUT|ENOTFOUND|ECONNRESET|ECONNREFUSED|network|unable to download/i.test(e),
+    );
+    if (!ladderResult.src && !opts.signal?.aborted && hasNoMatch && !hasTransient) {
       ladderResult = await runLadder(true);
     }
 
@@ -251,11 +257,21 @@ export async function processTrack(track: Track, opts: PipelineOptions): Promise
         );
       }
 
-      // Verifikasi WAV
+      // Verifikasi WAV - gagal di sini = file palsu, bukan error provider,
+      // jadi jangan diklasifikasikan "provider" (itu membuatnya di-retry = download ulang sia-sia).
       if (format === "wav") {
+      try {
         const p = await probe(outFile);
         assertRealWav(p);
+      } catch (err) {
+        throw new AppError(
+          err instanceof Error ? err.message : String(err),
+          "format",
+          providerUsed,
+          false,
+        );
       }
+    }
 
       // Verifikasi file tidak kosong
       const stat = fs.statSync(outFile);

@@ -236,11 +236,13 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
   const out = await runYtDlp(args, 60_000);
   const line = out.trim().split("\n")[0] ?? "";
   const [vid, title, channel, duration, thumb] = line.split("\t");
+  const parsedDuration = duration ? Number.parseFloat(duration) : Number.NaN;
   return {
     id: vid ?? id,
     title: title ?? "Unknown",
     channel: channel ?? "Unknown",
-    durationSec: duration ? parseFloat(duration) : null,
+    // yt-dlp print "NA" saat durasi tidak diketahui - NaN tidak boleh lolos ke UI/JSON.
+    durationSec: Number.isFinite(parsedDuration) ? parsedDuration : null,
     thumbnailUrl: thumb ?? null,
   };
 }

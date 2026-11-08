@@ -828,6 +828,7 @@ select {
 .thumb-wrap.st-searching .thumb-badge { color: var(--info-deep); }
 .thumb-wrap.st-downloading .thumb-badge { color: var(--accent-deep); }
 .thumb-wrap.st-transcoding .thumb-badge { color: var(--info-deep); }
+.thumb-wrap.st-lyrics .thumb-badge { color: var(--info-deep); }
 .thumb-wrap.st-done .thumb-badge { background: var(--accent); color: #fff; }
 .thumb-wrap.st-failed .thumb-badge { background: var(--error); color: #fff; }
 .thumb-wrap.st-skipped .thumb-badge { color: var(--warn-deep); }

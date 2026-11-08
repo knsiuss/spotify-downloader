@@ -8,6 +8,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { resolveBinary } from "../lib/binaries.js";
 import { trackChild } from "../lib/procs.js";
@@ -38,10 +39,11 @@ function run(cmd: string, args: string[]): Promise<void> {
   });
 }
 
-/** Download cover art, return bytes JPEG/PNG. Null kalau gagal (jangan gagalkan track). */
+/** Download cover art, return bytes JPEG/PNG. Null kalau gagal (jangan gagalkan track).
+ *  Timeout 10s - cover yang stall tidak boleh menahan worker selamanya. */
 export async function downloadCover(url: string): Promise<Buffer | null> {
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return null;
     const buf = Buffer.from(await res.arrayBuffer());
     return buf.length > 0 ? buf : null;
@@ -63,8 +65,9 @@ export async function embedCoverArt(
 ): Promise<void> {
   if (format === "wav") return;
 
-  // ffmpeg butuh file di disk untuk input gambar.
-  const tmp = path.join(os.tmpdir(), `spotfid-cover-${Date.now()}.jpg`);
+  // ffmpeg butuh file di disk untuk input gambar. Nama unik per panggilan -
+  // Date.now() bentrok saat banyak worker embed cover di milidetik yang sama.
+  const tmp = path.join(os.tmpdir(), `spotfid-cover-${randomUUID()}.jpg`);
   fs.writeFileSync(tmp, coverBytes);
 
   try {
@@ -75,6 +78,9 @@ export async function embedCoverArt(
       "-i", tmp,
       "-map", "0:a",
       "-map", "1:v",
+      // Audio JANGAN di-encode ulang - ini menyisipkan cover, bukan transcode lagi
+      // (MP3 yang sudah 256k akan turun kualitasnya kalau lewat lame kedua kali).
+      "-c:a", "copy",
       "-c:v", "mjpeg",
       "-disposition:v", "attached_pic",
     ];

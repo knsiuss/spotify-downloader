@@ -23,6 +23,8 @@ import { downloadVideo, getVideoInfo, isYouTubeUrl, isYouTubePlaylistUrl, getYou
 import type { VideoResolution, VideoFormat } from "./video/youtube-video.js";
 import { fetchLyrics } from "./lyrics/lrclib.js";
 import { loadQobuzConfig } from "./providers/qobuz.js";
+import { clampNumber } from "./lib/validate.js";
+import { sanitizeFilename } from "./audio/ffmpeg.js";
 
 initLogging();
 
@@ -101,15 +103,24 @@ async function runMusicJob(job: Job, reqObj: DownloadRequest): Promise<void> {
   let source;
   try {
     const { fetchSpotifyMetadata } = await import("./metadata/spotify.js");
-    source = await fetchSpotifyMetadata(reqObj.input);
+    source = await fetchSpotifyMetadata(reqObj.input, job.signal);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    // Cancel saat metadata fetch tidak boleh terlihat sebagai "error" di UI.
+    if (job.signal.aborted) {
+      finishJob(job, "cancelled", { type: "cancelled" });
+      return;
+    }
     finishJob(job, "error", { type: "error", error: msg }, { error: msg });
     return;
   }
 
-  const tracks = reqObj.limit
-    ? source.tracks.slice(0, Math.max(1, reqObj.limit))
+  // Slice hanya untuk daftar track di event start; downloadTracks menghitung ulang sendiri.
+  const trackLimit = reqObj.limit !== undefined && Number.isFinite(reqObj.limit) && reqObj.limit > 0
+    ? Math.floor(reqObj.limit)
+    : undefined;
+  const tracks = trackLimit
+    ? source.tracks.slice(0, trackLimit)
     : source.tracks;
 
   // Label & meta ramah-user untuk halaman Riwayat (nama + cover, bukan URL).
@@ -195,7 +206,9 @@ async function runVideoJob(
         // === PLAYLIST PATH ===
         job.label = pl.title || job.label;
         job.meta = { name: pl.title, cover: pl.thumbnailUrl, formats: `${params.resolution}p ${params.format}` };
-        const folder = `${params.outputDir}/${pl.title.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")}`;
+        // Sama persis dengan sanitasi di downloadYouTubePlaylist (path.join + sanitizeFilename)
+        // supaya path yang tampil di UI = lokasi file sungguhan.
+        const folder = path.join(params.outputDir, sanitizeFilename(pl.title));
         emit({
           type: "start",
           kind: "video-playlist",
@@ -213,31 +226,29 @@ async function runVideoJob(
           for (const v of activeSpeeds.values()) { if (v && v > 0) { sum += v; any = true; } }
           return any ? sum : null;
         };
-        const result = await downloadYouTubePlaylist(params as any, pl, {
+        const result = await downloadYouTubePlaylist(params, pl, {
           signal: job.signal,
           onStage: (stage, index) => emit({ type: "track_stage", index, stage }),
           onFileProgress: (p, index) => {
             activeSpeeds.set(index, p.speedBps);
-            (job as any).progress = { completed: completedCount, total: pl.videos.length, speedBps: sumSpeeds() };
+            job.progress = { completed: completedCount, total: pl.videos.length, speedBps: sumSpeeds() };
             emit({ type: "track_progress", index, percent: p.percent, speedBps: p.speedBps, etaSec: p.etaSec, downloadedBytes: p.downloadedBytes, totalBytes: p.totalBytes });
           },
           onRetry: (info, index) => emit({ type: "track_retry", index, ...info }),
           onTrack: (r, index) => {
-            const ok = r.ok;
-            const skipped = r.error === "sudah ada";
-            emit({ type: "track", index, title: r.title, ok, provider: "youtube", error: r.error, hasLyrics: false, instrumental: false, outputPath: r.outputPath });
+            emit({ type: "track", index, title: r.title, ok: r.ok, provider: "youtube", error: r.error, hasLyrics: false, instrumental: false, outputPath: r.outputPath });
           },
           onProgress: (completed, total) => {
             completedCount = completed;
-            (job as any).progress = { completed, total, speedBps: sumSpeeds() };
+            job.progress = { completed, total, speedBps: sumSpeeds() };
             emit({ type: "progress", completed, total });
           },
         });
         if (job.signal.aborted || result.error === "cancelled") {
-          finishJob(job, "cancelled", { type: "cancelled", summary: result as any }, { summary: { ...result } as any });
+          finishJob(job, "cancelled", { type: "cancelled", summary: { ...result } }, { summary: { ...result } });
         } else {
           const summary = { total: result.count, succeeded: result.succeeded, failed: result.failed, skipped: result.skipped, outputPath: result.outputDir };
-          finishJob(job, "done", { type: "done", summary, reportPath: null }, { summary: summary as any });
+          finishJob(job, "done", { type: "done", summary, reportPath: null }, { summary });
         }
         return;
       }
@@ -416,6 +427,8 @@ const server = http.createServer(async (req, res) => {
         ? ["/select,", target]
         : [target];
       const child = spawn("explorer.exe", args, { detached: true, stdio: "ignore", windowsHide: true });
+      // Tanpa listener, kegagalan spawn (mis. di platform non-Windows) = uncaught 'error' event.
+      child.on("error", (e) => console.error("[open-path] gagal spawn explorer:", e.message));
       child.unref();
       sendJson(res, 200, { ok: true });
     } catch (err) {
@@ -452,10 +465,12 @@ const server = http.createServer(async (req, res) => {
         input: String(inputUrl),
         outputDir: resolvedOutputDir,
         formats: fmtList as DownloadRequest["formats"],
-        limit: limit ? Number(limit) : undefined,
+        // Body API tak dipercaya: angka aneh dipaksa finite & di-clamp,
+        // bukan dibiarkan jadi NaN yang lolos ke worker.
+        limit: limit === undefined ? undefined : clampNumber(limit, 0, 1, 10_000) || undefined,
         fetchLyrics: Boolean(wantLyrics),
-        concurrency: concurrency ? Number(concurrency) : undefined,
-        retries: retries ? Number(retries) : undefined,
+        concurrency: concurrency === undefined ? undefined : clampNumber(concurrency, 3, 1, 8),
+        retries: retries === undefined ? undefined : clampNumber(retries, 1, 0, 5),
         cookiesFile: cookiesFile ? String(cookiesFile) : undefined,
       };
 

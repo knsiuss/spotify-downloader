@@ -5,7 +5,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { YouTubeProvider } from "../providers/youtube.js";
 import { SoundCloudProvider } from "../providers/soundcloud.js";
-import { QobuzProvider, loadQobuzConfig } from "../providers/qobuz.js";
+import { QobuzProvider, loadQobuzConfig, generateFileUrlRequestSignature, md5hex } from "../providers/qobuz.js";
 
 describe("YouTubeProvider", () => {
   it("priority = 100", () => {
@@ -26,6 +26,31 @@ describe("SoundCloudProvider", () => {
     const p = new SoundCloudProvider();
     assert.equal(p.priority, 110);
     assert.equal(p.name, "soundcloud");
+  });
+});
+
+describe("generateFileUrlRequestSignature", () => {
+  it("md5/rsa tidak — hanya md5 hex standar", () => {
+    assert.equal(md5hex("test_pass"), "4ac1b63dca561d274c6055ebf3ed97db");
+  });
+
+  it("sesuai algoritma QobuzApiSharp (data = trackgetFileUrlformat_id.. + track_id.. + ts + secret)", () => {
+    // Vektor diverifikasi terhadap Python hashlib (md5 standar).
+    const sig = generateFileUrlRequestSignature("27", "7398", "1234567890", "testsecret");
+    assert.equal(sig, "71075d66d16fad07d450ced81423bbc1");
+  });
+
+  it("signature berubah kalau salah satu komponen berubah", () => {
+    const a = generateFileUrlRequestSignature("27", "7398", "1234567890", "testsecret");
+    assert.notEqual(generateFileUrlRequestSignature("7", "7398", "1234567890", "testsecret"), a);
+    assert.notEqual(generateFileUrlRequestSignature("27", "7399", "1234567890", "testsecret"), a);
+    assert.notEqual(generateFileUrlRequestSignature("27", "7398", "1234567890", "other"), a);
+    assert.notEqual(generateFileUrlRequestSignature("27", "7398", "999", "testsecret"), a);
+  });
+
+  it("return hex 32 karakter lowercase", () => {
+    const sig = generateFileUrlRequestSignature("27", "1", "1", "x");
+    assert.match(sig, /^[0-9a-f]{32}$/);
   });
 });
 
