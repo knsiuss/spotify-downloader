@@ -235,8 +235,9 @@ export class YouTubeProvider implements Provider {
 
   async download(candidate: Candidate, workDir: string, ctx?: ProviderContext): Promise<string> {
     const outPath = path.join(workDir, `${candidate.id}.%(ext)s`);
+    // candidate.id berasal dari ytsearch output (bukan input user langsung),
+    // tapi tetap pakai "--" defensif: URL diawali "-" tidak boleh jadi flag.
     const args = [
-      candidate.url,
       "-f",
       "bestaudio/best",
       "--no-playlist",
@@ -245,6 +246,8 @@ export class YouTubeProvider implements Provider {
       "--no-warnings",
       "--newline",
       ...this.clientArgs(),
+      "--",
+      candidate.url,
     ];
     await runYtDlp(args, {
       signal: ctx?.signal,

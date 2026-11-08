@@ -41,8 +41,9 @@ export class SoundCloudProvider implements Provider {
 
   async download(candidate: Candidate, workDir: string, ctx?: ProviderContext): Promise<string> {
     const outPath = path.join(workDir, `${candidate.id}.%(ext)s`);
+    // candidate.id berasal dari yt-dlp search output (bukan input user),
+    // "--" defensif supaya URL diawali "-" tidak pernah jadi flag yt-dlp.
     const args = [
-      candidate.url,
       "-f",
       "bestaudio/best",
       "--no-playlist",
@@ -50,6 +51,8 @@ export class SoundCloudProvider implements Provider {
       outPath,
       "--no-warnings",
       "--newline",
+      "--",
+      candidate.url,
     ];
     await runYtDlp(args, {
       signal: ctx?.signal,

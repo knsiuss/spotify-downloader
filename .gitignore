@@ -24,13 +24,15 @@ next-env.d.ts
 # ==========================================
 # Binary Tools & Executables (yt-dlp, ffmpeg, electron)
 # ==========================================
-bin/*.exe
+# bin/yt-dlp.exe, bin/ffmpeg.exe, bin/ffprobe.exe SENGAJA DI-TRACK:
+# mereka dibundel ke installer desktop (extraResources electron-builder).
 bin/*.zip
 bin/*.tar.gz
 bin/*.7z
 release/
 *.exe
 *.dll
+!bin/*.exe
 
 # ==========================================
 # Downloaded Audio Outputs & Temp Files

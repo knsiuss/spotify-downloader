@@ -50,12 +50,31 @@ export function parseYouTubeUrl(url: string): string | null {
   return m ? m[1] : null;
 }
 
+/**
+ * Validasi ketat: URL harus benar-benar berupa URL https YouTube.
+ * Versi lama menerima string apa pun yang MENGANDUNG "youtube.com" — itu
+ * membuka argument injection ke yt-dlp (token diawali "-" diparse yt-dlp
+ * sebagai flag seperti --config-locations / --batch-file).
+ */
 export function isYouTubeUrl(url: string): boolean {
-  return YT_RE.test(url) || YT_PLAYLIST_RE.test(url) || url.includes("youtube.com") || url.includes("youtu.be");
+  if (typeof url !== "string" || url.startsWith("-") || /\s/.test(url)) return false;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:") return false;
+    if (!/^(www\.|music\.)?(youtube\.com|youtu\.be)$/.test(u.hostname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function isYouTubePlaylistUrl(url: string): boolean {
-  return YT_PLAYLIST_RE.test(url) || url.includes("/playlist?list=");
+  if (!isYouTubeUrl(url)) return false;
+  try {
+    const u = new URL(url);
+    if (u.pathname === "/playlist" && u.searchParams.has("list")) return true;
+  } catch { /* jatuh ke regex */ }
+  return YT_PLAYLIST_RE.test(url);
 }
 
 export function parseYouTubePlaylistId(url: string): string | null {
@@ -169,7 +188,6 @@ export function buildVideoArgs(
   cookiesFile?: string,
 ): string[] {
   const args = [
-    videoUrl,
     "-f", buildVideoFormat(resolution, format),
     "-S", buildVideoSort(resolution, format),
     "--merge-output-format", format,
@@ -180,6 +198,11 @@ export function buildVideoArgs(
     "--no-warnings",
     "--js-runtimes", "node",
   ];
+  // URL terakhir, di belakang "--": yt-dlp memperlakukan semua argumen
+  // SETELAH "--" sebagai positional — jadi URL minus flag orang yang
+  // meng-inject sesuatu seperti "--config-locations=...". videoUrl dari
+  // body API (tidak tepercaya), jadi pertahanan berlapis di sini.
+  args.push("--", videoUrl);
   if (cookiesFile) args.push("--cookies", cookiesFile);
   return args;
 }
@@ -226,12 +249,14 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
   const id = parseYouTubeUrl(url);
   if (!id) throw new Error("URL YouTube tidak valid");
 
+  // URL terakhir di belakang "--" supaya tidak bisa jadi flag (lihat buildVideoArgs).
   const args = [
-    url,
-    "--no-download",
     "--print", "%(id)s\t%(title)s\t%(channel)s\t%(duration)s\t%(thumbnail)s",
+    "--no-download",
     "--no-warnings",
     "--js-runtimes", "node",
+    "--",
+    url,
   ];
   const out = await runYtDlp(args, 60_000);
   const line = out.trim().split("\n")[0] ?? "";
@@ -251,11 +276,12 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
 export async function getYouTubePlaylistInfo(url: string): Promise<YouTubePlaylistInfo> {
   const pid = parseYouTubePlaylistId(url) ?? "playlist";
   const args = [
-    url,
     "--flat-playlist",
     "--dump-single-json",
     "--no-warnings",
     "--js-runtimes", "node",
+    "--",
+    url,
   ];
   const out = await runYtDlp(args, 90_000);
   let data: any;

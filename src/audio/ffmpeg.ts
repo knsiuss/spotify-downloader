@@ -129,9 +129,18 @@ export function assertRealWav(probe: AudioProbe): void {
   }
 }
 
-/** Sanitasi nama file dari metadata track. */
+/**
+ * Sanitasi nama file/folder dari metadata track.
+ * WAJIB menutup traversal: hasil "." / ".." / kosong / hanya-dot akan di-
+ * path.join() menjadi parent directory (playlist berjudul ".." => tulis
+ * ke root drive). Juga tolak nama reserved Windows (CON/PRN/AUX/NUL/COM/LPT)
+ * karena di Windows itu tidak bisa jadi nama file.
+ */
 export function sanitizeFilename(name: string): string {
-  return name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").replace(/\s+/g, " ").trim().slice(0, 120);
+  let s = name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").replace(/\s+/g, " ").trim().slice(0, 120);
+  if (/^\.+$/.test(s)) s = "untitled"; // ".", "..", "...", dll
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(s)) s = `${s}_`;
+  return s || "untitled";
 }
 
 /** Cari file output yang sudah ada (skip logic). */

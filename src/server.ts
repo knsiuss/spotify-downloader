@@ -457,6 +457,10 @@ const server = http.createServer(async (req, res) => {
       if (!inputUrl || typeof inputUrl !== "string") { sendJson(res, 400, { error: "url wajib diisi (Spotify link)" }); return; }
       const resolvedOutputDir = outputDir ? path.resolve(String(outputDir)) : path.resolve(process.cwd(), "output");
       const fmtList = String(formats).split(",").map((f) => f.trim().toLowerCase()).filter(Boolean);
+      // formats="" atau ",,," menghasilkan array KOSONG — tanpa penolakan di
+      // sini, guard "[].every()" di pipeline menganggap semua file "sudah
+      // ada" dan job lapor sukses tanpa menulis file apa pun.
+      if (fmtList.length === 0) { sendJson(res, 400, { error: "format tidak boleh kosong. Pilih: wav, flac, mp3" }); return; }
       for (const f of fmtList) {
         if (!AUDIO_FORMATS.has(f)) { sendJson(res, 400, { error: `format tidak valid: ${f}. Pilih: wav, flac, mp3` }); return; }
       }

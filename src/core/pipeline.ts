@@ -143,6 +143,10 @@ export async function processTrack(track: Track, opts: PipelineOptions): Promise
 
   const baseName = sanitizeFilename(`${track.artists.join(", ")} - ${track.title}`);
 
+  // Guard defensif: formats kosong di semua pemanggil -> SEMUA track akan
+  // lapor "sudah ada" tanpa menulis file ([].every() === true).
+  if (opts.formats.length === 0) return fail("Format output tidak dipilih", "format");
+
   // Resume: skip kalau semua format sudah ada.
   if (opts.formats.every((f) => outputExists(opts.outputDir, baseName, f))) {
     return { ...fail("sudah ada"), ok: true, outputPath: path.join(opts.outputDir, baseName) };
