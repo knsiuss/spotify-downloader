@@ -7,8 +7,9 @@
     "spotdlr": "./dist/cli/index.js"
   },
   "scripts": {
-    "build": "tsc && node scripts/write-server-pkg.mjs && npm run build:web",
+    "build": "npm run download-bins && tsc && node scripts/write-server-pkg.mjs && npm run build:web",
     "build:web": "cd web && npx next build",
+    "download-bins": "node scripts/download-bins.mjs",
     "dev": "tsx src/cli/index.ts",
     "start": "node dist/server.js",
     "server": "node dist/server.js",
