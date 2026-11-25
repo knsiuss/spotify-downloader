@@ -1,6 +1,7 @@
 {
   "name": "spotify-downloader",
   "version": "0.2.0",
+  "license": "MIT",
   "description": "Spotify playlist downloader -> WAV/FLAC/MP3 dari sumber eksternal (tanpa akun Spotify)",
   "type": "module",
   "bin": {
